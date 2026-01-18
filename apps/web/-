@@ -1,0 +1,2716 @@
+
+
+SET statement_timeout = 0;
+SET lock_timeout = 0;
+SET idle_in_transaction_session_timeout = 0;
+SET client_encoding = 'UTF8';
+SET standard_conforming_strings = on;
+SELECT pg_catalog.set_config('search_path', '', false);
+SET check_function_bodies = false;
+SET xmloption = content;
+SET client_min_messages = warning;
+SET row_security = off;
+
+
+CREATE SCHEMA IF NOT EXISTS "kit";
+
+
+ALTER SCHEMA "kit" OWNER TO "postgres";
+
+
+CREATE EXTENSION IF NOT EXISTS "pg_net" WITH SCHEMA "extensions";
+
+
+
+
+
+
+COMMENT ON SCHEMA "public" IS 'standard public schema';
+
+
+
+CREATE EXTENSION IF NOT EXISTS "pg_graphql" WITH SCHEMA "graphql";
+
+
+
+
+
+
+CREATE EXTENSION IF NOT EXISTS "pg_stat_statements" WITH SCHEMA "extensions";
+
+
+
+
+
+
+CREATE EXTENSION IF NOT EXISTS "pgcrypto" WITH SCHEMA "extensions";
+
+
+
+
+
+
+CREATE EXTENSION IF NOT EXISTS "pgjwt" WITH SCHEMA "extensions";
+
+
+
+
+
+
+CREATE EXTENSION IF NOT EXISTS "supabase_vault" WITH SCHEMA "vault";
+
+
+
+
+
+
+CREATE EXTENSION IF NOT EXISTS "unaccent" WITH SCHEMA "kit";
+
+
+
+
+
+
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp" WITH SCHEMA "extensions";
+
+
+
+
+
+
+CREATE OR REPLACE FUNCTION "kit"."get_storage_filename_as_uuid"("name" "text") RETURNS "uuid"
+    LANGUAGE "plpgsql"
+    SET "search_path" TO ''
+    AS $$
+begin
+    return replace(storage.filename(name), concat('.',
+                                                  storage.extension(name)), '')::uuid;
+
+end;
+
+$$;
+
+
+ALTER FUNCTION "kit"."get_storage_filename_as_uuid"("name" "text") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "kit"."handle_update_user_email"() RETURNS "trigger"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO ''
+    AS $$
+begin
+    update
+        public.accounts
+    set email = new.email
+    where id = new.id;
+
+    return new;
+
+end;
+
+$$;
+
+
+ALTER FUNCTION "kit"."handle_update_user_email"() OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "kit"."new_user_created_setup"() RETURNS "trigger"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO ''
+    AS $$
+declare
+    user_name   text;
+    picture_url text;
+begin
+    if new.raw_user_meta_data ->> 'name' is not null then
+        user_name := new.raw_user_meta_data ->> 'name';
+
+    end if;
+
+    if user_name is null and new.email is not null then
+        user_name := split_part(new.email, '@', 1);
+
+    end if;
+
+    if user_name is null then
+        user_name := '';
+
+    end if;
+
+    if new.raw_user_meta_data ->> 'avatar_url' is not null then
+        picture_url := new.raw_user_meta_data ->> 'avatar_url';
+    else
+        picture_url := null;
+    end if;
+
+    insert into public.accounts(id,
+                                name,
+                                picture_url,
+                                email)
+    values (new.id,
+            user_name,
+            picture_url,
+            new.email);
+
+    return new;
+
+end;
+
+$$;
+
+
+ALTER FUNCTION "kit"."new_user_created_setup"() OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "kit"."protect_account_fields"() RETURNS "trigger"
+    LANGUAGE "plpgsql"
+    SET "search_path" TO ''
+    AS $$
+begin
+    if current_user in ('authenticated', 'anon') then
+        if new.id <> old.id or new.email <> old.email then
+            raise exception 'You do not have permission to update this field';
+
+        end if;
+
+    end if;
+
+    return NEW;
+
+end
+$$;
+
+
+ALTER FUNCTION "kit"."protect_account_fields"() OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."create_organization_owner_member"() RETURNS "trigger"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    AS $$
+BEGIN
+  INSERT INTO public.organization_members (organization_id, user_id, role, joined_at)
+  VALUES (NEW.id, NEW.owner_id, 'owner', now());
+  RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."create_organization_owner_member"() OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."create_user_profile_on_signup"() RETURNS "trigger"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO ''
+    AS $$
+DECLARE
+  v_display_name TEXT;
+BEGIN
+  -- Extract display name from metadata or email
+  v_display_name := COALESCE(
+    NEW.raw_user_meta_data->>'full_name',
+    NEW.raw_user_meta_data->>'name',
+    SPLIT_PART(NEW.email, '@', 1)
+  );
+
+  -- Insert user profile
+  INSERT INTO public.user_profiles (
+    user_id,
+    display_name,
+    first_name,
+    last_name,
+    avatar_url,
+    user_type,
+    is_active
+  )
+  VALUES (
+    NEW.id,
+    v_display_name,
+    NEW.raw_user_meta_data->>'given_name',
+    NEW.raw_user_meta_data->>'family_name',
+    NEW.raw_user_meta_data->>'avatar_url',
+    'staff', -- Default user type
+    true
+  )
+  ON CONFLICT (user_id) DO UPDATE SET
+    display_name = EXCLUDED.display_name,
+    first_name = EXCLUDED.first_name,
+    last_name = EXCLUDED.last_name,
+    avatar_url = EXCLUDED.avatar_url,
+    updated_at = NOW();
+
+  RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."create_user_profile_on_signup"() OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."notify_driver_on_assignment"() RETURNS "trigger"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    AS $$
+DECLARE
+  v_driver_user_id UUID;
+  v_mission_name VARCHAR(255);
+BEGIN
+  -- Seulement si le driver_id a changé et n'est pas NULL
+  IF NEW.driver_id IS NOT NULL AND (OLD.driver_id IS NULL OR OLD.driver_id != NEW.driver_id) THEN
+    -- Récupérer l'user_id du chauffeur
+    SELECT user_id INTO v_driver_user_id
+    FROM public.user_profiles
+    WHERE id = NEW.driver_id;
+
+    IF v_driver_user_id IS NOT NULL THEN
+      PERFORM notify_user(
+        v_driver_user_id,
+        NEW.organization_id,
+        'mission_assigned',
+        'Nouvelle mission assignée',
+        'La mission "' || NEW.name || '" vous a été assignée.',
+        'mission',
+        NEW.id
+      );
+    END IF;
+  END IF;
+
+  RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."notify_driver_on_assignment"() OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."notify_user"("p_user_id" "uuid", "p_org_id" "uuid", "p_type" character varying, "p_title" character varying, "p_message" "text" DEFAULT NULL::"text", "p_link_type" character varying DEFAULT NULL::character varying, "p_link_id" "uuid" DEFAULT NULL::"uuid") RETURNS "uuid"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    AS $$
+DECLARE
+  v_notification_id UUID;
+BEGIN
+  INSERT INTO public.notifications (
+    organization_id, user_id, notification_type, title, message, link_type, link_id
+  ) VALUES (
+    p_org_id, p_user_id, p_type, p_title, p_message, p_link_type, p_link_id
+  ) RETURNING id INTO v_notification_id;
+
+  RETURN v_notification_id;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."notify_user"("p_user_id" "uuid", "p_org_id" "uuid", "p_type" character varying, "p_title" character varying, "p_message" "text", "p_link_type" character varying, "p_link_id" "uuid") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."update_organization_config_timestamp"() RETURNS "trigger"
+    LANGUAGE "plpgsql"
+    AS $$
+BEGIN
+  NEW.updated_at = NOW();
+  RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."update_organization_config_timestamp"() OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."update_updated_at_column"() RETURNS "trigger"
+    LANGUAGE "plpgsql"
+    AS $$
+BEGIN
+  NEW.updated_at = NOW();
+  RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."update_updated_at_column"() OWNER TO "postgres";
+
+SET default_tablespace = '';
+
+SET default_table_access_method = "heap";
+
+
+CREATE TABLE IF NOT EXISTS "public"."accounts" (
+    "id" "uuid" DEFAULT "extensions"."uuid_generate_v4"() NOT NULL,
+    "name" character varying(255) NOT NULL,
+    "email" character varying(320),
+    "updated_at" timestamp with time zone,
+    "created_at" timestamp with time zone,
+    "created_by" "uuid",
+    "updated_by" "uuid",
+    "picture_url" character varying(1000),
+    "public_data" "jsonb" DEFAULT '{}'::"jsonb" NOT NULL
+);
+
+
+ALTER TABLE "public"."accounts" OWNER TO "postgres";
+
+
+COMMENT ON TABLE "public"."accounts" IS 'Accounts are the top level entity in the Supabase MakerKit';
+
+
+
+COMMENT ON COLUMN "public"."accounts"."name" IS 'The name of the account';
+
+
+
+COMMENT ON COLUMN "public"."accounts"."email" IS 'The email of the account. For teams, this is the email of the team (if any)';
+
+
+
+COMMENT ON COLUMN "public"."accounts"."updated_at" IS 'The timestamp when the account was last updated';
+
+
+
+COMMENT ON COLUMN "public"."accounts"."created_at" IS 'The timestamp when the account was created';
+
+
+
+COMMENT ON COLUMN "public"."accounts"."created_by" IS 'The user who created the account';
+
+
+
+COMMENT ON COLUMN "public"."accounts"."updated_by" IS 'The user who last updated the account';
+
+
+
+COMMENT ON COLUMN "public"."accounts"."picture_url" IS 'The picture url of the account';
+
+
+
+COMMENT ON COLUMN "public"."accounts"."public_data" IS 'The public data of the account. Use this to store any additional data that you want to store for the account';
+
+
+
+CREATE TABLE IF NOT EXISTS "public"."arrets" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "tournee_id" "uuid",
+    "passager_id" "uuid",
+    "ordre_sequence" integer NOT NULL,
+    "adresse" "text" NOT NULL,
+    "latitude" numeric(10,8) NOT NULL,
+    "longitude" numeric(11,8) NOT NULL,
+    "heure_prevue" time without time zone NOT NULL,
+    "heure_reelle" time without time zone,
+    "type_arret" character varying(50) DEFAULT 'ramassage'::character varying,
+    "fenetre_temps_debut" time without time zone,
+    "fenetre_temps_fin" time without time zone,
+    "statut" character varying(50) DEFAULT 'planifie'::character varying,
+    "distance_depuis_precedent_km" numeric(10,2),
+    "duree_depuis_precedent_minutes" integer,
+    "created_at" timestamp with time zone DEFAULT "now"(),
+    "updated_at" timestamp with time zone DEFAULT "now"(),
+    "organization_id" "uuid"
+);
+
+
+ALTER TABLE "public"."arrets" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."bus" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "numero_bus" character varying(50) NOT NULL,
+    "immatriculation" character varying(50) NOT NULL,
+    "capacite" integer NOT NULL,
+    "type_bus" character varying(50) DEFAULT 'standard'::character varying,
+    "statut" character varying(50) DEFAULT 'disponible'::character varying,
+    "equipements" "jsonb" DEFAULT '[]'::"jsonb",
+    "created_at" timestamp with time zone DEFAULT "now"(),
+    "updated_at" timestamp with time zone DEFAULT "now"(),
+    "organization_id" "uuid",
+    "domain_type" character varying(50) DEFAULT 'school_transport'::character varying,
+    CONSTRAINT "bus_capacite_check" CHECK (("capacite" > 0))
+);
+
+
+ALTER TABLE "public"."bus" OWNER TO "postgres";
+
+
+COMMENT ON COLUMN "public"."bus"."organization_id" IS 'ID de l organisation propriétaire';
+
+
+
+COMMENT ON COLUMN "public"."bus"."domain_type" IS 'Type de domaine de l organisation';
+
+
+
+CREATE TABLE IF NOT EXISTS "public"."contraintes_optimisation" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "nom_contrainte" character varying(255) NOT NULL,
+    "type_contrainte" character varying(100) NOT NULL,
+    "valeur" "jsonb" NOT NULL,
+    "actif" boolean DEFAULT true,
+    "created_at" timestamp with time zone DEFAULT "now"(),
+    "updated_at" timestamp with time zone DEFAULT "now"(),
+    "organization_id" "uuid"
+);
+
+
+ALTER TABLE "public"."contraintes_optimisation" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."evenements" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "tournee_id" "uuid",
+    "type_evenement" character varying(100) NOT NULL,
+    "titre" character varying(255) NOT NULL,
+    "message" "text",
+    "niveau_priorite" character varying(50) DEFAULT 'info'::character varying,
+    "destinataires" "jsonb" DEFAULT '[]'::"jsonb",
+    "lu" boolean DEFAULT false,
+    "created_at" timestamp with time zone DEFAULT "now"(),
+    "organization_id" "uuid"
+);
+
+
+ALTER TABLE "public"."evenements" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."inscriptions" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "passager_id" "uuid",
+    "tournee_id" "uuid",
+    "date_inscription" timestamp with time zone DEFAULT "now"(),
+    "statut" character varying(50) DEFAULT 'confirmee'::character varying,
+    "besoin_retour" boolean DEFAULT false,
+    "notes" "text",
+    "created_at" timestamp with time zone DEFAULT "now"(),
+    "updated_at" timestamp with time zone DEFAULT "now"(),
+    "organization_id" "uuid"
+);
+
+
+ALTER TABLE "public"."inscriptions" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."invitations" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "organization_id" "uuid" NOT NULL,
+    "email" character varying(255) NOT NULL,
+    "phone" character varying(50),
+    "role" character varying(50) DEFAULT 'member'::character varying,
+    "user_type" character varying(50) DEFAULT 'staff'::character varying,
+    "token" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "status" character varying(20) DEFAULT 'pending'::character varying,
+    "expires_at" timestamp with time zone DEFAULT ("now"() + '7 days'::interval),
+    "accepted_at" timestamp with time zone,
+    "created_at" timestamp with time zone DEFAULT "now"(),
+    "invited_by" "uuid",
+    CONSTRAINT "invitations_status_check" CHECK ((("status")::"text" = ANY ((ARRAY['pending'::character varying, 'accepted'::character varying, 'expired'::character varying, 'cancelled'::character varying])::"text"[])))
+);
+
+
+ALTER TABLE "public"."invitations" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."items" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "organization_id" "uuid" NOT NULL,
+    "name" character varying(255) NOT NULL,
+    "identifier" character varying(100),
+    "description" "text",
+    "item_type" character varying(100) NOT NULL,
+    "icon" character varying(50) DEFAULT 'package'::character varying,
+    "color" character varying(50) DEFAULT '#f59e0b'::character varying,
+    "pickup_site_id" "uuid",
+    "dropoff_site_id" "uuid",
+    "current_location_latitude" numeric(10,8),
+    "current_location_longitude" numeric(11,8),
+    "contact_name" character varying(255),
+    "contact_phone" character varying(50),
+    "contact_email" character varying(255),
+    "weight_kg" numeric(10,2),
+    "volume_m3" numeric(10,3),
+    "dimensions" "jsonb",
+    "special_requirements" "jsonb" DEFAULT '[]'::"jsonb",
+    "priority" character varying(50) DEFAULT 'standard'::character varying,
+    "attributes" "jsonb" DEFAULT '{}'::"jsonb",
+    "status" character varying(50) DEFAULT 'pending'::character varying,
+    "metadata" "jsonb" DEFAULT '{}'::"jsonb",
+    "created_at" timestamp with time zone DEFAULT "now"(),
+    "updated_at" timestamp with time zone DEFAULT "now"(),
+    "element_type_id" character varying(100) DEFAULT 'default_item'::character varying,
+    CONSTRAINT "items_priority_check" CHECK ((("priority")::"text" = ANY ((ARRAY['urgent'::character varying, 'high'::character varying, 'standard'::character varying, 'low'::character varying])::"text"[]))),
+    CONSTRAINT "items_status_check" CHECK ((("status")::"text" = ANY ((ARRAY['pending'::character varying, 'assigned'::character varying, 'in_transit'::character varying, 'delivered'::character varying, 'cancelled'::character varying])::"text"[])))
+);
+
+
+ALTER TABLE "public"."items" OWNER TO "postgres";
+
+
+COMMENT ON TABLE "public"."items" IS 'Items transportés (passagers, colis, produits) - Générique';
+
+
+
+COMMENT ON COLUMN "public"."items"."attributes" IS 'Attributs personnalisés JSON (âge, classe pour élèves, température pour colis, etc.)';
+
+
+
+CREATE TABLE IF NOT EXISTS "public"."missions" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "organization_id" "uuid" NOT NULL,
+    "reference" character varying(100) NOT NULL,
+    "name" character varying(255) NOT NULL,
+    "description" "text",
+    "route_id" "uuid",
+    "driver_id" "uuid",
+    "vehicle_id" "uuid",
+    "scheduled_date" "date" NOT NULL,
+    "start_time" time without time zone NOT NULL,
+    "estimated_end_time" time without time zone,
+    "status" character varying(30) DEFAULT 'draft'::character varying,
+    "actual_start_time" timestamp with time zone,
+    "actual_end_time" timestamp with time zone,
+    "actual_distance_km" double precision,
+    "dispatcher_notes" "text",
+    "driver_notes" "text",
+    "completion_notes" "text",
+    "priority" character varying(20) DEFAULT 'normal'::character varying,
+    "metadata" "jsonb" DEFAULT '{}'::"jsonb",
+    "created_at" timestamp with time zone DEFAULT "now"(),
+    "updated_at" timestamp with time zone DEFAULT "now"(),
+    "created_by" "uuid",
+    CONSTRAINT "missions_priority_check" CHECK ((("priority")::"text" = ANY ((ARRAY['urgent'::character varying, 'high'::character varying, 'normal'::character varying, 'low'::character varying])::"text"[]))),
+    CONSTRAINT "missions_status_check" CHECK ((("status")::"text" = ANY ((ARRAY['draft'::character varying, 'planned'::character varying, 'assigned'::character varying, 'accepted'::character varying, 'in_progress'::character varying, 'completed'::character varying, 'cancelled'::character varying])::"text"[])))
+);
+
+
+ALTER TABLE "public"."missions" OWNER TO "postgres";
+
+
+COMMENT ON TABLE "public"."missions" IS 'Missions assignées aux chauffeurs';
+
+
+
+CREATE TABLE IF NOT EXISTS "public"."notifications" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "organization_id" "uuid" NOT NULL,
+    "user_id" "uuid" NOT NULL,
+    "notification_type" character varying(50) NOT NULL,
+    "title" character varying(255) NOT NULL,
+    "message" "text",
+    "link_type" character varying(50),
+    "link_id" "uuid",
+    "is_read" boolean DEFAULT false,
+    "read_at" timestamp with time zone,
+    "metadata" "jsonb" DEFAULT '{}'::"jsonb",
+    "created_at" timestamp with time zone DEFAULT "now"()
+);
+
+
+ALTER TABLE "public"."notifications" OWNER TO "postgres";
+
+
+COMMENT ON TABLE "public"."notifications" IS 'Notifications temps réel pour les utilisateurs';
+
+
+
+CREATE TABLE IF NOT EXISTS "public"."organization_configs" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "organization_id" "uuid" NOT NULL,
+    "labels" "jsonb" DEFAULT '{"item": "Élément", "site": "Site", "mission": "Mission", "vehicle": "Véhicule", "itemPlural": "Éléments", "sitePlural": "Sites", "missionPlural": "Missions", "vehiclePlural": "Véhicules"}'::"jsonb" NOT NULL,
+    "vehicle_types" "jsonb" DEFAULT '[]'::"jsonb" NOT NULL,
+    "site_types" "jsonb" DEFAULT '[]'::"jsonb" NOT NULL,
+    "item_types" "jsonb" DEFAULT '[]'::"jsonb" NOT NULL,
+    "settings" "jsonb" DEFAULT '{"currency": "EUR", "language": "fr", "timezone": "Europe/Paris", "defaultZoom": 13, "distanceUnit": "km", "defaultMapCenter": [48.8566, 2.3522]}'::"jsonb" NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"(),
+    "updated_at" timestamp with time zone DEFAULT "now"()
+);
+
+
+ALTER TABLE "public"."organization_configs" OWNER TO "postgres";
+
+
+COMMENT ON TABLE "public"."organization_configs" IS 'Configuration personnalisable par organisation - types d''éléments, labels, paramètres';
+
+
+
+COMMENT ON COLUMN "public"."organization_configs"."labels" IS 'Labels personnalisés pour l''interface utilisateur';
+
+
+
+COMMENT ON COLUMN "public"."organization_configs"."vehicle_types" IS 'Types de véhicules définis par l''utilisateur';
+
+
+
+COMMENT ON COLUMN "public"."organization_configs"."site_types" IS 'Types de sites définis par l''utilisateur';
+
+
+
+COMMENT ON COLUMN "public"."organization_configs"."item_types" IS 'Types d''items définis par l''utilisateur';
+
+
+
+CREATE TABLE IF NOT EXISTS "public"."organization_members" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "organization_id" "uuid" NOT NULL,
+    "user_id" "uuid" NOT NULL,
+    "role" character varying(50) DEFAULT 'member'::character varying,
+    "permissions" "jsonb" DEFAULT '[]'::"jsonb",
+    "invited_at" timestamp with time zone DEFAULT "now"(),
+    "joined_at" timestamp with time zone,
+    "created_at" timestamp with time zone DEFAULT "now"(),
+    "updated_at" timestamp with time zone DEFAULT "now"(),
+    "user_type" character varying(50) DEFAULT 'staff'::character varying,
+    CONSTRAINT "organization_members_role_check" CHECK ((("role")::"text" = ANY ((ARRAY['owner'::character varying, 'admin'::character varying, 'manager'::character varying, 'member'::character varying])::"text"[])))
+);
+
+
+ALTER TABLE "public"."organization_members" OWNER TO "postgres";
+
+
+COMMENT ON TABLE "public"."organization_members" IS 'Membres des organisations avec leurs rôles';
+
+
+
+CREATE TABLE IF NOT EXISTS "public"."organizations" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "owner_id" "uuid" NOT NULL,
+    "name" character varying(255) NOT NULL,
+    "slug" character varying(255) NOT NULL,
+    "domain_type" character varying(50) NOT NULL,
+    "domain_config" "jsonb" DEFAULT '{}'::"jsonb" NOT NULL,
+    "description" "text",
+    "logo_url" "text",
+    "contact_email" character varying(255),
+    "contact_phone" character varying(50),
+    "address" "text",
+    "city" character varying(100),
+    "postal_code" character varying(20),
+    "country" character varying(100) DEFAULT 'France'::character varying,
+    "metadata" "jsonb" DEFAULT '{}'::"jsonb",
+    "status" character varying(50) DEFAULT 'active'::character varying,
+    "subscription_plan" character varying(50) DEFAULT 'free'::character varying,
+    "subscription_status" character varying(50) DEFAULT 'active'::character varying,
+    "created_at" timestamp with time zone DEFAULT "now"(),
+    "updated_at" timestamp with time zone DEFAULT "now"(),
+    CONSTRAINT "organizations_domain_type_check" CHECK ((("domain_type")::"text" = ANY ((ARRAY['school_transport'::character varying, 'logistics'::character varying, 'urban_transit'::character varying, 'medical_transport'::character varying, 'waste_collection'::character varying, 'custom'::character varying])::"text"[]))),
+    CONSTRAINT "organizations_status_check" CHECK ((("status")::"text" = ANY ((ARRAY['active'::character varying, 'suspended'::character varying, 'cancelled'::character varying])::"text"[])))
+);
+
+
+ALTER TABLE "public"."organizations" OWNER TO "postgres";
+
+
+COMMENT ON TABLE "public"."organizations" IS 'Organisations multi-tenant avec configuration de domaine';
+
+
+
+COMMENT ON COLUMN "public"."organizations"."domain_type" IS 'Type de domaine: school_transport, logistics, urban_transit, etc.';
+
+
+
+COMMENT ON COLUMN "public"."organizations"."domain_config" IS 'Configuration JSONB complète du domaine (labels, champs, contraintes, KPIs)';
+
+
+
+CREATE TABLE IF NOT EXISTS "public"."passagers" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "nom" character varying(255) NOT NULL,
+    "prenom" character varying(255) NOT NULL,
+    "email" character varying(255),
+    "telephone" character varying(50),
+    "adresse_complete" "text" NOT NULL,
+    "latitude" numeric(10,8),
+    "longitude" numeric(11,8),
+    "code_postal" character varying(20),
+    "ville" character varying(100),
+    "date_naissance" "date",
+    "type_passager" character varying(50) DEFAULT 'etudiant'::character varying,
+    "besoins_specifiques" "text",
+    "created_at" timestamp with time zone DEFAULT "now"(),
+    "updated_at" timestamp with time zone DEFAULT "now"(),
+    "organization_id" "uuid",
+    "domain_type" character varying(50) DEFAULT 'school_transport'::character varying
+);
+
+
+ALTER TABLE "public"."passagers" OWNER TO "postgres";
+
+
+COMMENT ON COLUMN "public"."passagers"."organization_id" IS 'ID de l organisation propriétaire';
+
+
+
+COMMENT ON COLUMN "public"."passagers"."domain_type" IS 'Type de domaine de l organisation';
+
+
+
+CREATE TABLE IF NOT EXISTS "public"."positions_gps" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "bus_id" "uuid",
+    "tournee_id" "uuid",
+    "latitude" numeric(10,8) NOT NULL,
+    "longitude" numeric(11,8) NOT NULL,
+    "vitesse_kmh" numeric(5,2),
+    "cap_degres" integer,
+    "precision_metres" numeric(10,2),
+    "timestamp_gps" timestamp with time zone DEFAULT "now"(),
+    "created_at" timestamp with time zone DEFAULT "now"(),
+    "organization_id" "uuid"
+);
+
+
+ALTER TABLE "public"."positions_gps" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."route_stops" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "route_id" "uuid" NOT NULL,
+    "site_id" "uuid" NOT NULL,
+    "sequence_order" integer NOT NULL,
+    "stop_type" character varying(50) DEFAULT 'pickup'::character varying,
+    "item_ids" "uuid"[],
+    "planned_arrival_time" time without time zone,
+    "planned_departure_time" time without time zone,
+    "time_window_start" time without time zone,
+    "time_window_end" time without time zone,
+    "actual_arrival_time" timestamp with time zone,
+    "actual_departure_time" timestamp with time zone,
+    "distance_from_previous_km" numeric(10,2),
+    "duration_from_previous_minutes" integer,
+    "status" character varying(50) DEFAULT 'pending'::character varying,
+    "notes" "text",
+    "created_at" timestamp with time zone DEFAULT "now"(),
+    "updated_at" timestamp with time zone DEFAULT "now"(),
+    CONSTRAINT "route_stops_status_check" CHECK ((("status")::"text" = ANY ((ARRAY['pending'::character varying, 'arrived'::character varying, 'in_progress'::character varying, 'completed'::character varying, 'skipped'::character varying])::"text"[]))),
+    CONSTRAINT "route_stops_stop_type_check" CHECK ((("stop_type")::"text" = ANY ((ARRAY['pickup'::character varying, 'dropoff'::character varying, 'waypoint'::character varying, 'depot'::character varying])::"text"[])))
+);
+
+
+ALTER TABLE "public"."route_stops" OWNER TO "postgres";
+
+
+COMMENT ON TABLE "public"."route_stops" IS 'Arrêts dans une route avec séquence';
+
+
+
+CREATE TABLE IF NOT EXISTS "public"."routes" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "organization_id" "uuid" NOT NULL,
+    "name" character varying(255) NOT NULL,
+    "description" "text",
+    "vehicle_id" "uuid",
+    "route_type" character varying(100) DEFAULT 'delivery'::character varying,
+    "planned_date" "date" NOT NULL,
+    "planned_start_time" time without time zone,
+    "planned_end_time" time without time zone,
+    "actual_start_time" timestamp with time zone,
+    "actual_end_time" timestamp with time zone,
+    "total_distance_km" numeric(10,2),
+    "estimated_duration_minutes" integer,
+    "actual_duration_minutes" integer,
+    "stops_sequence" "jsonb" DEFAULT '[]'::"jsonb",
+    "assigned_items_ids" "uuid"[],
+    "status" character varying(50) DEFAULT 'planned'::character varying,
+    "is_optimized" boolean DEFAULT false,
+    "optimization_score" numeric(5,2),
+    "metadata" "jsonb" DEFAULT '{}'::"jsonb",
+    "created_at" timestamp with time zone DEFAULT "now"(),
+    "updated_at" timestamp with time zone DEFAULT "now"(),
+    CONSTRAINT "routes_status_check" CHECK ((("status")::"text" = ANY ((ARRAY['planned'::character varying, 'in_progress'::character varying, 'completed'::character varying, 'cancelled'::character varying, 'paused'::character varying])::"text"[])))
+);
+
+
+ALTER TABLE "public"."routes" OWNER TO "postgres";
+
+
+COMMENT ON TABLE "public"."routes" IS 'Routes/Missions/Tournées génériques';
+
+
+
+CREATE TABLE IF NOT EXISTS "public"."sites" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "organization_id" "uuid" NOT NULL,
+    "name" character varying(255) NOT NULL,
+    "description" "text",
+    "site_type" character varying(100) NOT NULL,
+    "icon" character varying(50) DEFAULT 'map-pin'::character varying,
+    "color" character varying(50) DEFAULT '#10b981'::character varying,
+    "latitude" numeric(10,8) NOT NULL,
+    "longitude" numeric(11,8) NOT NULL,
+    "address" "text",
+    "city" character varying(100),
+    "postal_code" character varying(20),
+    "country" character varying(100) DEFAULT 'France'::character varying,
+    "contact_name" character varying(255),
+    "contact_phone" character varying(50),
+    "contact_email" character varying(255),
+    "opening_hours" "jsonb",
+    "constraints" "jsonb" DEFAULT '{}'::"jsonb",
+    "attributes" "jsonb" DEFAULT '{}'::"jsonb",
+    "status" character varying(50) DEFAULT 'active'::character varying,
+    "metadata" "jsonb" DEFAULT '{}'::"jsonb",
+    "created_at" timestamp with time zone DEFAULT "now"(),
+    "updated_at" timestamp with time zone DEFAULT "now"(),
+    "element_type_id" character varying(100) DEFAULT 'default_depot'::character varying,
+    "capacity_weight_kg" numeric(10,2) DEFAULT NULL::numeric,
+    "capacity_volume_m3" numeric(10,3) DEFAULT NULL::numeric,
+    "capacity_items_count" integer,
+    CONSTRAINT "sites_capacity_items_count_check" CHECK ((("capacity_items_count" >= 0) OR ("capacity_items_count" IS NULL))),
+    CONSTRAINT "sites_capacity_volume_m3_check" CHECK ((("capacity_volume_m3" >= (0)::numeric) OR ("capacity_volume_m3" IS NULL))),
+    CONSTRAINT "sites_capacity_weight_kg_check" CHECK ((("capacity_weight_kg" >= (0)::numeric) OR ("capacity_weight_kg" IS NULL))),
+    CONSTRAINT "sites_status_check" CHECK ((("status")::"text" = ANY ((ARRAY['active'::character varying, 'inactive'::character varying, 'temporary'::character varying])::"text"[])))
+);
+
+
+ALTER TABLE "public"."sites" OWNER TO "postgres";
+
+
+COMMENT ON TABLE "public"."sites" IS 'Sites/Locations sur la carte (dépôts, écoles, entrepôts, stations)';
+
+
+
+COMMENT ON COLUMN "public"."sites"."attributes" IS 'Attributs personnalisés JSON (capacité, équipements, etc.)';
+
+
+
+COMMENT ON COLUMN "public"."sites"."capacity_weight_kg" IS 'Capacité de stockage maximale en kilogrammes';
+
+
+
+COMMENT ON COLUMN "public"."sites"."capacity_volume_m3" IS 'Capacité de stockage maximale en mètres cubes';
+
+
+
+COMMENT ON COLUMN "public"."sites"."capacity_items_count" IS 'Nombre maximum d''items que le site peut contenir';
+
+
+
+CREATE OR REPLACE VIEW "public"."site_occupancy" AS
+ SELECT "s"."id" AS "site_id",
+    "s"."name" AS "site_name",
+    "s"."organization_id",
+    "s"."capacity_weight_kg",
+    "s"."capacity_volume_m3",
+    "s"."capacity_items_count",
+    "count"(DISTINCT "i"."id") AS "current_items_count",
+    COALESCE("sum"("i"."weight_kg"), (0)::numeric) AS "current_weight_kg",
+    COALESCE("sum"("i"."volume_m3"), (0)::numeric) AS "current_volume_m3",
+        CASE
+            WHEN (("s"."capacity_items_count" IS NOT NULL) AND ("s"."capacity_items_count" > 0)) THEN "round"(((("count"(DISTINCT "i"."id"))::numeric / ("s"."capacity_items_count")::numeric) * (100)::numeric), 2)
+            ELSE NULL::numeric
+        END AS "items_occupancy_percent",
+        CASE
+            WHEN (("s"."capacity_weight_kg" IS NOT NULL) AND ("s"."capacity_weight_kg" > (0)::numeric)) THEN "round"(((COALESCE("sum"("i"."weight_kg"), (0)::numeric) / "s"."capacity_weight_kg") * (100)::numeric), 2)
+            ELSE NULL::numeric
+        END AS "weight_occupancy_percent",
+        CASE
+            WHEN (("s"."capacity_volume_m3" IS NOT NULL) AND ("s"."capacity_volume_m3" > (0)::numeric)) THEN "round"(((COALESCE("sum"("i"."volume_m3"), (0)::numeric) / "s"."capacity_volume_m3") * (100)::numeric), 2)
+            ELSE NULL::numeric
+        END AS "volume_occupancy_percent",
+        CASE
+            WHEN ((("s"."capacity_items_count" IS NOT NULL) AND ("count"(DISTINCT "i"."id") >= "s"."capacity_items_count")) OR (("s"."capacity_weight_kg" IS NOT NULL) AND (COALESCE("sum"("i"."weight_kg"), (0)::numeric) >= "s"."capacity_weight_kg")) OR (("s"."capacity_volume_m3" IS NOT NULL) AND (COALESCE("sum"("i"."volume_m3"), (0)::numeric) >= "s"."capacity_volume_m3"))) THEN true
+            ELSE false
+        END AS "is_full"
+   FROM ("public"."sites" "s"
+     LEFT JOIN "public"."items" "i" ON (((("i"."pickup_site_id" = "s"."id") OR ("i"."dropoff_site_id" = "s"."id")) AND (("i"."status")::"text" = ANY ((ARRAY['pending'::character varying, 'delivered'::character varying, 'assigned'::character varying])::"text"[])))))
+  GROUP BY "s"."id", "s"."name", "s"."organization_id", "s"."capacity_weight_kg", "s"."capacity_volume_m3", "s"."capacity_items_count";
+
+
+ALTER TABLE "public"."site_occupancy" OWNER TO "postgres";
+
+
+COMMENT ON VIEW "public"."site_occupancy" IS 'Vue qui calcule l''occupation actuelle de chaque site et détermine si le site est plein';
+
+
+
+CREATE TABLE IF NOT EXISTS "public"."tournees" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "nom_tournee" character varying(255) NOT NULL,
+    "bus_id" "uuid",
+    "date_tournee" "date" NOT NULL,
+    "heure_depart" time without time zone NOT NULL,
+    "heure_arrivee_estimee" time without time zone,
+    "duree_estimee_minutes" integer,
+    "distance_totale_km" numeric(10,2),
+    "statut" character varying(50) DEFAULT 'planifiee'::character varying,
+    "nombre_passagers" integer DEFAULT 0,
+    "sequence_arrets" "jsonb" DEFAULT '[]'::"jsonb",
+    "created_at" timestamp with time zone DEFAULT "now"(),
+    "updated_at" timestamp with time zone DEFAULT "now"(),
+    "organization_id" "uuid",
+    "domain_type" character varying(50) DEFAULT 'school_transport'::character varying
+);
+
+
+ALTER TABLE "public"."tournees" OWNER TO "postgres";
+
+
+COMMENT ON COLUMN "public"."tournees"."organization_id" IS 'ID de l organisation propriétaire';
+
+
+
+COMMENT ON COLUMN "public"."tournees"."domain_type" IS 'Type de domaine de l organisation';
+
+
+
+CREATE TABLE IF NOT EXISTS "public"."user_profiles" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "user_id" "uuid" NOT NULL,
+    "organization_id" "uuid",
+    "first_name" character varying(100),
+    "last_name" character varying(100),
+    "display_name" character varying(255),
+    "avatar_url" "text",
+    "phone" character varying(50),
+    "user_type" character varying(50) DEFAULT 'staff'::character varying NOT NULL,
+    "type_config" "jsonb" DEFAULT '{}'::"jsonb",
+    "license_number" character varying(100),
+    "license_expiry" "date",
+    "vehicle_assigned_id" "uuid",
+    "pickup_site_id" "uuid",
+    "delivery_site_id" "uuid",
+    "notification_preferences" "jsonb" DEFAULT '{"sms": false, "push": true, "email": true}'::"jsonb",
+    "language" character varying(10) DEFAULT 'fr'::character varying,
+    "timezone" character varying(50) DEFAULT 'Europe/Paris'::character varying,
+    "is_active" boolean DEFAULT true,
+    "last_login_at" timestamp with time zone,
+    "created_at" timestamp with time zone DEFAULT "now"(),
+    "updated_at" timestamp with time zone DEFAULT "now"(),
+    CONSTRAINT "user_profiles_user_type_check" CHECK ((("user_type")::"text" = ANY ((ARRAY['admin'::character varying, 'dispatcher'::character varying, 'driver'::character varying, 'client'::character varying, 'staff'::character varying, 'supervisor'::character varying])::"text"[])))
+);
+
+
+ALTER TABLE "public"."user_profiles" OWNER TO "postgres";
+
+
+COMMENT ON TABLE "public"."user_profiles" IS 'Profils utilisateurs avec type (admin, driver, client, etc.)';
+
+
+
+COMMENT ON COLUMN "public"."user_profiles"."user_type" IS 'Type d''utilisateur: admin, dispatcher, driver, client, staff, supervisor';
+
+
+
+CREATE TABLE IF NOT EXISTS "public"."vehicles" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "organization_id" "uuid" NOT NULL,
+    "name" character varying(255) NOT NULL,
+    "identifier" character varying(100),
+    "vehicle_type" character varying(100) NOT NULL,
+    "icon" character varying(50) DEFAULT 'truck'::character varying,
+    "color" character varying(50) DEFAULT '#3b82f6'::character varying,
+    "capacity" integer DEFAULT 0,
+    "attributes" "jsonb" DEFAULT '{}'::"jsonb",
+    "status" character varying(50) DEFAULT 'active'::character varying,
+    "current_latitude" numeric(10,8),
+    "current_longitude" numeric(11,8),
+    "last_position_update" timestamp with time zone,
+    "metadata" "jsonb" DEFAULT '{}'::"jsonb",
+    "created_at" timestamp with time zone DEFAULT "now"(),
+    "updated_at" timestamp with time zone DEFAULT "now"(),
+    "element_type_id" character varying(100) DEFAULT 'default_vehicle'::character varying,
+    "capacity_weight_kg" numeric(10,2) DEFAULT 0,
+    "capacity_volume_m3" numeric(10,3) DEFAULT 0,
+    "fuel_type" character varying(50) DEFAULT 'diesel'::character varying,
+    "fuel_consumption" numeric(8,2) DEFAULT 0,
+    "consumption_unit" character varying(20) DEFAULT 'L/100km'::character varying,
+    "tank_capacity" numeric(10,2),
+    "range_km" numeric(10,2),
+    "current_loaded_items" "uuid"[] DEFAULT '{}'::"uuid"[],
+    CONSTRAINT "vehicles_capacity_volume_m3_check" CHECK (("capacity_volume_m3" >= (0)::numeric)),
+    CONSTRAINT "vehicles_capacity_weight_kg_check" CHECK (("capacity_weight_kg" >= (0)::numeric)),
+    CONSTRAINT "vehicles_consumption_unit_check" CHECK ((("consumption_unit")::"text" = ANY ((ARRAY['L/100km'::character varying, 'kWh/100km'::character varying, 'km/kg'::character varying, 'm³/100km'::character varying])::"text"[]))),
+    CONSTRAINT "vehicles_fuel_consumption_check" CHECK (("fuel_consumption" >= (0)::numeric)),
+    CONSTRAINT "vehicles_fuel_type_check" CHECK ((("fuel_type")::"text" = ANY ((ARRAY['diesel'::character varying, 'gasoline'::character varying, 'electric'::character varying, 'hybrid'::character varying, 'hydrogen'::character varying, 'cng'::character varying, 'lpg'::character varying, 'other'::character varying])::"text"[]))),
+    CONSTRAINT "vehicles_range_km_check" CHECK ((("range_km" >= (0)::numeric) OR ("range_km" IS NULL))),
+    CONSTRAINT "vehicles_status_check" CHECK ((("status")::"text" = ANY ((ARRAY['active'::character varying, 'inactive'::character varying, 'maintenance'::character varying])::"text"[]))),
+    CONSTRAINT "vehicles_tank_capacity_check" CHECK ((("tank_capacity" >= (0)::numeric) OR ("tank_capacity" IS NULL)))
+);
+
+
+ALTER TABLE "public"."vehicles" OWNER TO "postgres";
+
+
+COMMENT ON TABLE "public"."vehicles" IS 'Véhicules génériques (bus, camions, trains, etc.)';
+
+
+
+COMMENT ON COLUMN "public"."vehicles"."attributes" IS 'Attributs personnalisés JSON (immatriculation, équipements, etc.)';
+
+
+
+COMMENT ON COLUMN "public"."vehicles"."capacity_weight_kg" IS 'Capacité de charge maximale en kilogrammes';
+
+
+
+COMMENT ON COLUMN "public"."vehicles"."capacity_volume_m3" IS 'Capacité de charge maximale en mètres cubes';
+
+
+
+COMMENT ON COLUMN "public"."vehicles"."fuel_type" IS 'Type de carburant ou d''énergie (diesel, electric, etc.)';
+
+
+
+COMMENT ON COLUMN "public"."vehicles"."fuel_consumption" IS 'Consommation moyenne (L/100km pour carburant, kWh/100km pour électrique)';
+
+
+
+COMMENT ON COLUMN "public"."vehicles"."consumption_unit" IS 'Unité de mesure de la consommation';
+
+
+
+COMMENT ON COLUMN "public"."vehicles"."tank_capacity" IS 'Capacité du réservoir (L) ou batterie (kWh)';
+
+
+
+COMMENT ON COLUMN "public"."vehicles"."range_km" IS 'Autonomie maximale en kilomètres';
+
+
+
+COMMENT ON COLUMN "public"."vehicles"."current_loaded_items" IS 'IDs des items actuellement chargés dans le véhicule. Mis à jour lors du pickup/dropoff.';
+
+
+
+ALTER TABLE ONLY "public"."accounts"
+    ADD CONSTRAINT "accounts_email_key" UNIQUE ("email");
+
+
+
+ALTER TABLE ONLY "public"."accounts"
+    ADD CONSTRAINT "accounts_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."arrets"
+    ADD CONSTRAINT "arrets_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."bus"
+    ADD CONSTRAINT "bus_immatriculation_key" UNIQUE ("immatriculation");
+
+
+
+ALTER TABLE ONLY "public"."bus"
+    ADD CONSTRAINT "bus_numero_bus_key" UNIQUE ("numero_bus");
+
+
+
+ALTER TABLE ONLY "public"."bus"
+    ADD CONSTRAINT "bus_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."contraintes_optimisation"
+    ADD CONSTRAINT "contraintes_optimisation_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."evenements"
+    ADD CONSTRAINT "evenements_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."inscriptions"
+    ADD CONSTRAINT "inscriptions_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."invitations"
+    ADD CONSTRAINT "invitations_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."invitations"
+    ADD CONSTRAINT "invitations_token_key" UNIQUE ("token");
+
+
+
+ALTER TABLE ONLY "public"."items"
+    ADD CONSTRAINT "items_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."missions"
+    ADD CONSTRAINT "missions_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."notifications"
+    ADD CONSTRAINT "notifications_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."organization_configs"
+    ADD CONSTRAINT "organization_configs_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."organization_members"
+    ADD CONSTRAINT "organization_members_organization_id_user_id_key" UNIQUE ("organization_id", "user_id");
+
+
+
+ALTER TABLE ONLY "public"."organization_members"
+    ADD CONSTRAINT "organization_members_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."organizations"
+    ADD CONSTRAINT "organizations_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."organizations"
+    ADD CONSTRAINT "organizations_slug_key" UNIQUE ("slug");
+
+
+
+ALTER TABLE ONLY "public"."passagers"
+    ADD CONSTRAINT "passagers_email_key" UNIQUE ("email");
+
+
+
+ALTER TABLE ONLY "public"."passagers"
+    ADD CONSTRAINT "passagers_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."positions_gps"
+    ADD CONSTRAINT "positions_gps_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."route_stops"
+    ADD CONSTRAINT "route_stops_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."routes"
+    ADD CONSTRAINT "routes_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."sites"
+    ADD CONSTRAINT "sites_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."tournees"
+    ADD CONSTRAINT "tournees_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."organization_configs"
+    ADD CONSTRAINT "unique_org_config" UNIQUE ("organization_id");
+
+
+
+ALTER TABLE ONLY "public"."user_profiles"
+    ADD CONSTRAINT "user_profiles_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."user_profiles"
+    ADD CONSTRAINT "user_profiles_user_id_key" UNIQUE ("user_id");
+
+
+
+ALTER TABLE ONLY "public"."vehicles"
+    ADD CONSTRAINT "vehicles_pkey" PRIMARY KEY ("id");
+
+
+
+CREATE INDEX "idx_arrets_ordre" ON "public"."arrets" USING "btree" ("tournee_id", "ordre_sequence");
+
+
+
+CREATE INDEX "idx_arrets_org" ON "public"."arrets" USING "btree" ("organization_id");
+
+
+
+CREATE INDEX "idx_arrets_tournee" ON "public"."arrets" USING "btree" ("tournee_id");
+
+
+
+CREATE INDEX "idx_bus_domain" ON "public"."bus" USING "btree" ("domain_type");
+
+
+
+CREATE INDEX "idx_bus_org" ON "public"."bus" USING "btree" ("organization_id");
+
+
+
+CREATE INDEX "idx_contraintes_org" ON "public"."contraintes_optimisation" USING "btree" ("organization_id");
+
+
+
+CREATE INDEX "idx_evenements_org" ON "public"."evenements" USING "btree" ("organization_id");
+
+
+
+CREATE INDEX "idx_evenements_tournee" ON "public"."evenements" USING "btree" ("tournee_id", "created_at" DESC);
+
+
+
+CREATE INDEX "idx_inscriptions_org" ON "public"."inscriptions" USING "btree" ("organization_id");
+
+
+
+CREATE INDEX "idx_inscriptions_passager" ON "public"."inscriptions" USING "btree" ("passager_id");
+
+
+
+CREATE INDEX "idx_inscriptions_tournee" ON "public"."inscriptions" USING "btree" ("tournee_id");
+
+
+
+CREATE INDEX "idx_invitations_email" ON "public"."invitations" USING "btree" ("email");
+
+
+
+CREATE INDEX "idx_invitations_org" ON "public"."invitations" USING "btree" ("organization_id");
+
+
+
+CREATE INDEX "idx_invitations_status" ON "public"."invitations" USING "btree" ("status");
+
+
+
+CREATE INDEX "idx_invitations_token" ON "public"."invitations" USING "btree" ("token");
+
+
+
+CREATE INDEX "idx_items_attributes" ON "public"."items" USING "gin" ("attributes");
+
+
+
+CREATE INDEX "idx_items_dropoff" ON "public"."items" USING "btree" ("dropoff_site_id");
+
+
+
+CREATE INDEX "idx_items_dropoff_site" ON "public"."items" USING "btree" ("dropoff_site_id") WHERE ("dropoff_site_id" IS NOT NULL);
+
+
+
+CREATE INDEX "idx_items_org" ON "public"."items" USING "btree" ("organization_id");
+
+
+
+CREATE INDEX "idx_items_pickup" ON "public"."items" USING "btree" ("pickup_site_id");
+
+
+
+CREATE INDEX "idx_items_pickup_site" ON "public"."items" USING "btree" ("pickup_site_id") WHERE ("pickup_site_id" IS NOT NULL);
+
+
+
+CREATE INDEX "idx_items_priority" ON "public"."items" USING "btree" ("priority");
+
+
+
+CREATE INDEX "idx_items_site_status" ON "public"."items" USING "btree" ("pickup_site_id", "dropoff_site_id", "status");
+
+
+
+CREATE INDEX "idx_items_status" ON "public"."items" USING "btree" ("status");
+
+
+
+CREATE INDEX "idx_items_type" ON "public"."items" USING "btree" ("item_type");
+
+
+
+CREATE INDEX "idx_missions_date" ON "public"."missions" USING "btree" ("scheduled_date");
+
+
+
+CREATE INDEX "idx_missions_driver" ON "public"."missions" USING "btree" ("driver_id");
+
+
+
+CREATE INDEX "idx_missions_org" ON "public"."missions" USING "btree" ("organization_id");
+
+
+
+CREATE INDEX "idx_missions_reference" ON "public"."missions" USING "btree" ("organization_id", "reference");
+
+
+
+CREATE INDEX "idx_missions_status" ON "public"."missions" USING "btree" ("status");
+
+
+
+CREATE INDEX "idx_notifications_created" ON "public"."notifications" USING "btree" ("created_at" DESC);
+
+
+
+CREATE INDEX "idx_notifications_unread" ON "public"."notifications" USING "btree" ("user_id", "is_read") WHERE ("is_read" = false);
+
+
+
+CREATE INDEX "idx_notifications_user" ON "public"."notifications" USING "btree" ("user_id");
+
+
+
+CREATE INDEX "idx_org_members_org" ON "public"."organization_members" USING "btree" ("organization_id");
+
+
+
+CREATE INDEX "idx_org_members_role" ON "public"."organization_members" USING "btree" ("role");
+
+
+
+CREATE INDEX "idx_org_members_user" ON "public"."organization_members" USING "btree" ("user_id");
+
+
+
+CREATE INDEX "idx_organization_configs_org_id" ON "public"."organization_configs" USING "btree" ("organization_id");
+
+
+
+CREATE INDEX "idx_organizations_config" ON "public"."organizations" USING "gin" ("domain_config");
+
+
+
+CREATE INDEX "idx_organizations_domain_type" ON "public"."organizations" USING "btree" ("domain_type");
+
+
+
+CREATE INDEX "idx_organizations_owner" ON "public"."organizations" USING "btree" ("owner_id");
+
+
+
+CREATE INDEX "idx_organizations_slug" ON "public"."organizations" USING "btree" ("slug");
+
+
+
+CREATE INDEX "idx_organizations_status" ON "public"."organizations" USING "btree" ("status");
+
+
+
+CREATE INDEX "idx_passagers_domain" ON "public"."passagers" USING "btree" ("domain_type");
+
+
+
+CREATE INDEX "idx_passagers_email" ON "public"."passagers" USING "btree" ("email");
+
+
+
+CREATE INDEX "idx_passagers_geoloc" ON "public"."passagers" USING "btree" ("latitude", "longitude");
+
+
+
+CREATE INDEX "idx_passagers_org" ON "public"."passagers" USING "btree" ("organization_id");
+
+
+
+CREATE INDEX "idx_positions_gps_bus" ON "public"."positions_gps" USING "btree" ("bus_id", "timestamp_gps" DESC);
+
+
+
+CREATE INDEX "idx_positions_gps_org" ON "public"."positions_gps" USING "btree" ("organization_id");
+
+
+
+CREATE INDEX "idx_positions_gps_tournee" ON "public"."positions_gps" USING "btree" ("tournee_id", "timestamp_gps" DESC);
+
+
+
+CREATE INDEX "idx_route_stops_order" ON "public"."route_stops" USING "btree" ("route_id", "sequence_order");
+
+
+
+CREATE INDEX "idx_route_stops_route" ON "public"."route_stops" USING "btree" ("route_id");
+
+
+
+CREATE INDEX "idx_route_stops_site" ON "public"."route_stops" USING "btree" ("site_id");
+
+
+
+CREATE INDEX "idx_routes_date" ON "public"."routes" USING "btree" ("planned_date");
+
+
+
+CREATE INDEX "idx_routes_org" ON "public"."routes" USING "btree" ("organization_id");
+
+
+
+CREATE INDEX "idx_routes_status" ON "public"."routes" USING "btree" ("status");
+
+
+
+CREATE INDEX "idx_routes_vehicle" ON "public"."routes" USING "btree" ("vehicle_id");
+
+
+
+CREATE INDEX "idx_sites_attributes" ON "public"."sites" USING "gin" ("attributes");
+
+
+
+CREATE INDEX "idx_sites_location" ON "public"."sites" USING "btree" ("latitude", "longitude");
+
+
+
+CREATE INDEX "idx_sites_org" ON "public"."sites" USING "btree" ("organization_id");
+
+
+
+CREATE INDEX "idx_sites_status" ON "public"."sites" USING "btree" ("status");
+
+
+
+CREATE INDEX "idx_sites_type" ON "public"."sites" USING "btree" ("site_type");
+
+
+
+CREATE INDEX "idx_tournees_date" ON "public"."tournees" USING "btree" ("date_tournee");
+
+
+
+CREATE INDEX "idx_tournees_domain" ON "public"."tournees" USING "btree" ("domain_type");
+
+
+
+CREATE INDEX "idx_tournees_org" ON "public"."tournees" USING "btree" ("organization_id");
+
+
+
+CREATE INDEX "idx_tournees_statut" ON "public"."tournees" USING "btree" ("statut");
+
+
+
+CREATE INDEX "idx_user_profiles_active" ON "public"."user_profiles" USING "btree" ("is_active") WHERE ("is_active" = true);
+
+
+
+CREATE INDEX "idx_user_profiles_org" ON "public"."user_profiles" USING "btree" ("organization_id");
+
+
+
+CREATE INDEX "idx_user_profiles_type" ON "public"."user_profiles" USING "btree" ("user_type");
+
+
+
+CREATE INDEX "idx_user_profiles_user" ON "public"."user_profiles" USING "btree" ("user_id");
+
+
+
+CREATE INDEX "idx_vehicles_attributes" ON "public"."vehicles" USING "gin" ("attributes");
+
+
+
+CREATE INDEX "idx_vehicles_capacity" ON "public"."vehicles" USING "btree" ("capacity_weight_kg", "capacity_volume_m3");
+
+
+
+CREATE INDEX "idx_vehicles_current_loaded_items" ON "public"."vehicles" USING "gin" ("current_loaded_items");
+
+
+
+CREATE INDEX "idx_vehicles_fuel_type" ON "public"."vehicles" USING "btree" ("fuel_type");
+
+
+
+CREATE INDEX "idx_vehicles_org" ON "public"."vehicles" USING "btree" ("organization_id");
+
+
+
+CREATE INDEX "idx_vehicles_position" ON "public"."vehicles" USING "btree" ("current_latitude", "current_longitude");
+
+
+
+CREATE INDEX "idx_vehicles_status" ON "public"."vehicles" USING "btree" ("status");
+
+
+
+CREATE INDEX "idx_vehicles_type" ON "public"."vehicles" USING "btree" ("vehicle_type");
+
+
+
+CREATE OR REPLACE TRIGGER "on_organization_created" AFTER INSERT ON "public"."organizations" FOR EACH ROW EXECUTE FUNCTION "public"."create_organization_owner_member"();
+
+
+
+CREATE OR REPLACE TRIGGER "protect_account_fields" BEFORE UPDATE ON "public"."accounts" FOR EACH ROW EXECUTE FUNCTION "kit"."protect_account_fields"();
+
+
+
+CREATE OR REPLACE TRIGGER "trigger_notify_driver_on_assignment" AFTER INSERT OR UPDATE OF "driver_id" ON "public"."missions" FOR EACH ROW EXECUTE FUNCTION "public"."notify_driver_on_assignment"();
+
+
+
+CREATE OR REPLACE TRIGGER "trigger_update_organization_config_timestamp" BEFORE UPDATE ON "public"."organization_configs" FOR EACH ROW EXECUTE FUNCTION "public"."update_organization_config_timestamp"();
+
+
+
+CREATE OR REPLACE TRIGGER "update_arrets_updated_at" BEFORE UPDATE ON "public"."arrets" FOR EACH ROW EXECUTE FUNCTION "public"."update_updated_at_column"();
+
+
+
+CREATE OR REPLACE TRIGGER "update_bus_updated_at" BEFORE UPDATE ON "public"."bus" FOR EACH ROW EXECUTE FUNCTION "public"."update_updated_at_column"();
+
+
+
+CREATE OR REPLACE TRIGGER "update_contraintes_updated_at" BEFORE UPDATE ON "public"."contraintes_optimisation" FOR EACH ROW EXECUTE FUNCTION "public"."update_updated_at_column"();
+
+
+
+CREATE OR REPLACE TRIGGER "update_inscriptions_updated_at" BEFORE UPDATE ON "public"."inscriptions" FOR EACH ROW EXECUTE FUNCTION "public"."update_updated_at_column"();
+
+
+
+CREATE OR REPLACE TRIGGER "update_items_updated_at" BEFORE UPDATE ON "public"."items" FOR EACH ROW EXECUTE FUNCTION "public"."update_updated_at_column"();
+
+
+
+CREATE OR REPLACE TRIGGER "update_org_members_updated_at" BEFORE UPDATE ON "public"."organization_members" FOR EACH ROW EXECUTE FUNCTION "public"."update_updated_at_column"();
+
+
+
+CREATE OR REPLACE TRIGGER "update_organizations_updated_at" BEFORE UPDATE ON "public"."organizations" FOR EACH ROW EXECUTE FUNCTION "public"."update_updated_at_column"();
+
+
+
+CREATE OR REPLACE TRIGGER "update_passagers_updated_at" BEFORE UPDATE ON "public"."passagers" FOR EACH ROW EXECUTE FUNCTION "public"."update_updated_at_column"();
+
+
+
+CREATE OR REPLACE TRIGGER "update_route_stops_updated_at" BEFORE UPDATE ON "public"."route_stops" FOR EACH ROW EXECUTE FUNCTION "public"."update_updated_at_column"();
+
+
+
+CREATE OR REPLACE TRIGGER "update_routes_updated_at" BEFORE UPDATE ON "public"."routes" FOR EACH ROW EXECUTE FUNCTION "public"."update_updated_at_column"();
+
+
+
+CREATE OR REPLACE TRIGGER "update_sites_updated_at" BEFORE UPDATE ON "public"."sites" FOR EACH ROW EXECUTE FUNCTION "public"."update_updated_at_column"();
+
+
+
+CREATE OR REPLACE TRIGGER "update_tournees_updated_at" BEFORE UPDATE ON "public"."tournees" FOR EACH ROW EXECUTE FUNCTION "public"."update_updated_at_column"();
+
+
+
+CREATE OR REPLACE TRIGGER "update_user_profiles_updated_at" BEFORE UPDATE ON "public"."user_profiles" FOR EACH ROW EXECUTE FUNCTION "public"."update_updated_at_column"();
+
+
+
+CREATE OR REPLACE TRIGGER "update_vehicles_updated_at" BEFORE UPDATE ON "public"."vehicles" FOR EACH ROW EXECUTE FUNCTION "public"."update_updated_at_column"();
+
+
+
+ALTER TABLE ONLY "public"."accounts"
+    ADD CONSTRAINT "accounts_created_by_fkey" FOREIGN KEY ("created_by") REFERENCES "auth"."users"("id");
+
+
+
+ALTER TABLE ONLY "public"."accounts"
+    ADD CONSTRAINT "accounts_updated_by_fkey" FOREIGN KEY ("updated_by") REFERENCES "auth"."users"("id");
+
+
+
+ALTER TABLE ONLY "public"."arrets"
+    ADD CONSTRAINT "arrets_organization_id_fkey" FOREIGN KEY ("organization_id") REFERENCES "public"."organizations"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."arrets"
+    ADD CONSTRAINT "arrets_passager_id_fkey" FOREIGN KEY ("passager_id") REFERENCES "public"."passagers"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."arrets"
+    ADD CONSTRAINT "arrets_tournee_id_fkey" FOREIGN KEY ("tournee_id") REFERENCES "public"."tournees"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."bus"
+    ADD CONSTRAINT "bus_organization_id_fkey" FOREIGN KEY ("organization_id") REFERENCES "public"."organizations"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."contraintes_optimisation"
+    ADD CONSTRAINT "contraintes_optimisation_organization_id_fkey" FOREIGN KEY ("organization_id") REFERENCES "public"."organizations"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."evenements"
+    ADD CONSTRAINT "evenements_organization_id_fkey" FOREIGN KEY ("organization_id") REFERENCES "public"."organizations"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."evenements"
+    ADD CONSTRAINT "evenements_tournee_id_fkey" FOREIGN KEY ("tournee_id") REFERENCES "public"."tournees"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."inscriptions"
+    ADD CONSTRAINT "inscriptions_organization_id_fkey" FOREIGN KEY ("organization_id") REFERENCES "public"."organizations"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."inscriptions"
+    ADD CONSTRAINT "inscriptions_passager_id_fkey" FOREIGN KEY ("passager_id") REFERENCES "public"."passagers"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."inscriptions"
+    ADD CONSTRAINT "inscriptions_tournee_id_fkey" FOREIGN KEY ("tournee_id") REFERENCES "public"."tournees"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."invitations"
+    ADD CONSTRAINT "invitations_invited_by_fkey" FOREIGN KEY ("invited_by") REFERENCES "auth"."users"("id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."invitations"
+    ADD CONSTRAINT "invitations_organization_id_fkey" FOREIGN KEY ("organization_id") REFERENCES "public"."organizations"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."items"
+    ADD CONSTRAINT "items_dropoff_site_id_fkey" FOREIGN KEY ("dropoff_site_id") REFERENCES "public"."sites"("id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."items"
+    ADD CONSTRAINT "items_organization_id_fkey" FOREIGN KEY ("organization_id") REFERENCES "public"."organizations"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."items"
+    ADD CONSTRAINT "items_pickup_site_id_fkey" FOREIGN KEY ("pickup_site_id") REFERENCES "public"."sites"("id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."missions"
+    ADD CONSTRAINT "missions_created_by_fkey" FOREIGN KEY ("created_by") REFERENCES "auth"."users"("id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."missions"
+    ADD CONSTRAINT "missions_driver_id_fkey" FOREIGN KEY ("driver_id") REFERENCES "public"."user_profiles"("id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."missions"
+    ADD CONSTRAINT "missions_organization_id_fkey" FOREIGN KEY ("organization_id") REFERENCES "public"."organizations"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."missions"
+    ADD CONSTRAINT "missions_route_id_fkey" FOREIGN KEY ("route_id") REFERENCES "public"."routes"("id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."missions"
+    ADD CONSTRAINT "missions_vehicle_id_fkey" FOREIGN KEY ("vehicle_id") REFERENCES "public"."vehicles"("id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."notifications"
+    ADD CONSTRAINT "notifications_organization_id_fkey" FOREIGN KEY ("organization_id") REFERENCES "public"."organizations"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."notifications"
+    ADD CONSTRAINT "notifications_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."organization_configs"
+    ADD CONSTRAINT "organization_configs_organization_id_fkey" FOREIGN KEY ("organization_id") REFERENCES "public"."organizations"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."organization_members"
+    ADD CONSTRAINT "organization_members_organization_id_fkey" FOREIGN KEY ("organization_id") REFERENCES "public"."organizations"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."organization_members"
+    ADD CONSTRAINT "organization_members_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."organizations"
+    ADD CONSTRAINT "organizations_owner_id_fkey" FOREIGN KEY ("owner_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."passagers"
+    ADD CONSTRAINT "passagers_organization_id_fkey" FOREIGN KEY ("organization_id") REFERENCES "public"."organizations"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."positions_gps"
+    ADD CONSTRAINT "positions_gps_bus_id_fkey" FOREIGN KEY ("bus_id") REFERENCES "public"."bus"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."positions_gps"
+    ADD CONSTRAINT "positions_gps_organization_id_fkey" FOREIGN KEY ("organization_id") REFERENCES "public"."organizations"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."positions_gps"
+    ADD CONSTRAINT "positions_gps_tournee_id_fkey" FOREIGN KEY ("tournee_id") REFERENCES "public"."tournees"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."route_stops"
+    ADD CONSTRAINT "route_stops_route_id_fkey" FOREIGN KEY ("route_id") REFERENCES "public"."routes"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."route_stops"
+    ADD CONSTRAINT "route_stops_site_id_fkey" FOREIGN KEY ("site_id") REFERENCES "public"."sites"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."routes"
+    ADD CONSTRAINT "routes_organization_id_fkey" FOREIGN KEY ("organization_id") REFERENCES "public"."organizations"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."routes"
+    ADD CONSTRAINT "routes_vehicle_id_fkey" FOREIGN KEY ("vehicle_id") REFERENCES "public"."vehicles"("id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."sites"
+    ADD CONSTRAINT "sites_organization_id_fkey" FOREIGN KEY ("organization_id") REFERENCES "public"."organizations"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."tournees"
+    ADD CONSTRAINT "tournees_bus_id_fkey" FOREIGN KEY ("bus_id") REFERENCES "public"."bus"("id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."tournees"
+    ADD CONSTRAINT "tournees_organization_id_fkey" FOREIGN KEY ("organization_id") REFERENCES "public"."organizations"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."user_profiles"
+    ADD CONSTRAINT "user_profiles_delivery_site_id_fkey" FOREIGN KEY ("delivery_site_id") REFERENCES "public"."sites"("id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."user_profiles"
+    ADD CONSTRAINT "user_profiles_organization_id_fkey" FOREIGN KEY ("organization_id") REFERENCES "public"."organizations"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."user_profiles"
+    ADD CONSTRAINT "user_profiles_pickup_site_id_fkey" FOREIGN KEY ("pickup_site_id") REFERENCES "public"."sites"("id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."user_profiles"
+    ADD CONSTRAINT "user_profiles_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."user_profiles"
+    ADD CONSTRAINT "user_profiles_vehicle_assigned_id_fkey" FOREIGN KEY ("vehicle_assigned_id") REFERENCES "public"."vehicles"("id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."vehicles"
+    ADD CONSTRAINT "vehicles_organization_id_fkey" FOREIGN KEY ("organization_id") REFERENCES "public"."organizations"("id") ON DELETE CASCADE;
+
+
+
+CREATE POLICY "Admins can manage profiles" ON "public"."user_profiles" USING (("organization_id" IN ( SELECT "organization_members"."organization_id"
+   FROM "public"."organization_members"
+  WHERE (("organization_members"."user_id" = "auth"."uid"()) AND (("organization_members"."role")::"text" = ANY ((ARRAY['owner'::character varying, 'admin'::character varying])::"text"[]))))));
+
+
+
+CREATE POLICY "Authenticated users can create organizations" ON "public"."organizations" FOR INSERT WITH CHECK ((("auth"."uid"() IS NOT NULL) AND ("owner_id" = "auth"."uid"())));
+
+
+
+CREATE POLICY "Dispatchers can manage missions" ON "public"."missions" USING (("organization_id" IN ( SELECT "organization_members"."organization_id"
+   FROM "public"."organization_members"
+  WHERE (("organization_members"."user_id" = "auth"."uid"()) AND (("organization_members"."role")::"text" = ANY ((ARRAY['owner'::character varying, 'admin'::character varying, 'manager'::character varying])::"text"[]))))));
+
+
+
+CREATE POLICY "Drivers can update assigned missions" ON "public"."missions" FOR UPDATE USING (("driver_id" IN ( SELECT "user_profiles"."id"
+   FROM "public"."user_profiles"
+  WHERE ("user_profiles"."user_id" = "auth"."uid"()))));
+
+
+
+CREATE POLICY "Org members can view missions" ON "public"."missions" FOR SELECT USING (("organization_id" IN ( SELECT "organization_members"."organization_id"
+   FROM "public"."organization_members"
+  WHERE ("organization_members"."user_id" = "auth"."uid"()))));
+
+
+
+CREATE POLICY "Org members can view profiles in their org" ON "public"."user_profiles" FOR SELECT USING (("organization_id" IN ( SELECT "organization_members"."organization_id"
+   FROM "public"."organization_members"
+  WHERE ("organization_members"."user_id" = "auth"."uid"()))));
+
+
+
+CREATE POLICY "Organization admins can update config" ON "public"."organization_configs" FOR UPDATE USING (("organization_id" IN ( SELECT "organization_members"."organization_id"
+   FROM "public"."organization_members"
+  WHERE (("organization_members"."user_id" = "auth"."uid"()) AND (("organization_members"."role")::"text" = ANY ((ARRAY['owner'::character varying, 'admin'::character varying])::"text"[]))))));
+
+
+
+CREATE POLICY "Organization members can create config" ON "public"."organization_configs" FOR INSERT WITH CHECK (("organization_id" IN ( SELECT "organization_members"."organization_id"
+   FROM "public"."organization_members"
+  WHERE (("organization_members"."user_id" = "auth"."uid"()) AND (("organization_members"."role")::"text" = ANY ((ARRAY['owner'::character varying, 'admin'::character varying])::"text"[]))))));
+
+
+
+CREATE POLICY "Organization members can read config" ON "public"."organization_configs" FOR SELECT USING (("organization_id" IN ( SELECT "organization_members"."organization_id"
+   FROM "public"."organization_members"
+  WHERE ("organization_members"."user_id" = "auth"."uid"()))));
+
+
+
+CREATE POLICY "Organization owners can delete config" ON "public"."organization_configs" FOR DELETE USING (("organization_id" IN ( SELECT "organization_members"."organization_id"
+   FROM "public"."organization_members"
+  WHERE (("organization_members"."user_id" = "auth"."uid"()) AND (("organization_members"."role")::"text" = 'owner'::"text")))));
+
+
+
+CREATE POLICY "Owners can delete their organizations" ON "public"."organizations" FOR DELETE USING (("owner_id" = "auth"."uid"()));
+
+
+
+CREATE POLICY "Owners can update their organizations" ON "public"."organizations" FOR UPDATE USING (("owner_id" = "auth"."uid"()));
+
+
+
+CREATE POLICY "Owners can view their organizations" ON "public"."organizations" FOR SELECT USING (("owner_id" = "auth"."uid"()));
+
+
+
+COMMENT ON POLICY "Owners can view their organizations" ON "public"."organizations" IS 'Les utilisateurs ne voient QUE les organisations qu''ils possèdent directement (pas de sous-requête)';
+
+
+
+CREATE POLICY "Users can delete bus in their org" ON "public"."bus" FOR DELETE USING (("organization_id" IN ( SELECT "organization_members"."organization_id"
+   FROM "public"."organization_members"
+  WHERE ("organization_members"."user_id" = "auth"."uid"()))));
+
+
+
+CREATE POLICY "Users can delete items in their org" ON "public"."items" FOR DELETE USING (("organization_id" IN ( SELECT "organizations"."id"
+   FROM "public"."organizations"
+  WHERE ("organizations"."owner_id" = "auth"."uid"()))));
+
+
+
+CREATE POLICY "Users can delete passagers in their org" ON "public"."passagers" FOR DELETE USING (("organization_id" IN ( SELECT "organization_members"."organization_id"
+   FROM "public"."organization_members"
+  WHERE ("organization_members"."user_id" = "auth"."uid"()))));
+
+
+
+CREATE POLICY "Users can delete route_stops in their org" ON "public"."route_stops" FOR DELETE USING (("route_id" IN ( SELECT "routes"."id"
+   FROM "public"."routes"
+  WHERE ("routes"."organization_id" IN ( SELECT "organizations"."id"
+           FROM "public"."organizations"
+          WHERE ("organizations"."owner_id" = "auth"."uid"()))))));
+
+
+
+CREATE POLICY "Users can delete routes in their org" ON "public"."routes" FOR DELETE USING (("organization_id" IN ( SELECT "organizations"."id"
+   FROM "public"."organizations"
+  WHERE ("organizations"."owner_id" = "auth"."uid"()))));
+
+
+
+CREATE POLICY "Users can delete sites in their org" ON "public"."sites" FOR DELETE USING (("organization_id" IN ( SELECT "organizations"."id"
+   FROM "public"."organizations"
+  WHERE ("organizations"."owner_id" = "auth"."uid"()))));
+
+
+
+CREATE POLICY "Users can delete tournees in their org" ON "public"."tournees" FOR DELETE USING (("organization_id" IN ( SELECT "organization_members"."organization_id"
+   FROM "public"."organization_members"
+  WHERE ("organization_members"."user_id" = "auth"."uid"()))));
+
+
+
+CREATE POLICY "Users can delete vehicles in their org" ON "public"."vehicles" FOR DELETE USING (("organization_id" IN ( SELECT "organizations"."id"
+   FROM "public"."organizations"
+  WHERE ("organizations"."owner_id" = "auth"."uid"()))));
+
+
+
+CREATE POLICY "Users can insert bus in their org" ON "public"."bus" FOR INSERT WITH CHECK (("organization_id" IN ( SELECT "organization_members"."organization_id"
+   FROM "public"."organization_members"
+  WHERE ("organization_members"."user_id" = "auth"."uid"()))));
+
+
+
+CREATE POLICY "Users can insert items in their org" ON "public"."items" FOR INSERT WITH CHECK (("organization_id" IN ( SELECT "organizations"."id"
+   FROM "public"."organizations"
+  WHERE ("organizations"."owner_id" = "auth"."uid"()))));
+
+
+
+CREATE POLICY "Users can insert own profile" ON "public"."user_profiles" FOR INSERT WITH CHECK (("user_id" = "auth"."uid"()));
+
+
+
+CREATE POLICY "Users can insert passagers in their org" ON "public"."passagers" FOR INSERT WITH CHECK (("organization_id" IN ( SELECT "organization_members"."organization_id"
+   FROM "public"."organization_members"
+  WHERE ("organization_members"."user_id" = "auth"."uid"()))));
+
+
+
+CREATE POLICY "Users can insert positions_gps in their org" ON "public"."positions_gps" FOR INSERT WITH CHECK (("organization_id" IN ( SELECT "organization_members"."organization_id"
+   FROM "public"."organization_members"
+  WHERE ("organization_members"."user_id" = "auth"."uid"()))));
+
+
+
+CREATE POLICY "Users can insert route_stops in their org" ON "public"."route_stops" FOR INSERT WITH CHECK (("route_id" IN ( SELECT "routes"."id"
+   FROM "public"."routes"
+  WHERE ("routes"."organization_id" IN ( SELECT "organizations"."id"
+           FROM "public"."organizations"
+          WHERE ("organizations"."owner_id" = "auth"."uid"()))))));
+
+
+
+CREATE POLICY "Users can insert routes in their org" ON "public"."routes" FOR INSERT WITH CHECK (("organization_id" IN ( SELECT "organizations"."id"
+   FROM "public"."organizations"
+  WHERE ("organizations"."owner_id" = "auth"."uid"()))));
+
+
+
+CREATE POLICY "Users can insert sites in their org" ON "public"."sites" FOR INSERT WITH CHECK (("organization_id" IN ( SELECT "organizations"."id"
+   FROM "public"."organizations"
+  WHERE ("organizations"."owner_id" = "auth"."uid"()))));
+
+
+
+CREATE POLICY "Users can insert tournees in their org" ON "public"."tournees" FOR INSERT WITH CHECK (("organization_id" IN ( SELECT "organization_members"."organization_id"
+   FROM "public"."organization_members"
+  WHERE ("organization_members"."user_id" = "auth"."uid"()))));
+
+
+
+CREATE POLICY "Users can insert vehicles in their org" ON "public"."vehicles" FOR INSERT WITH CHECK (("organization_id" IN ( SELECT "organizations"."id"
+   FROM "public"."organizations"
+  WHERE ("organizations"."owner_id" = "auth"."uid"()))));
+
+
+
+CREATE POLICY "Users can manage arrets in their org" ON "public"."arrets" USING (("organization_id" IN ( SELECT "organization_members"."organization_id"
+   FROM "public"."organization_members"
+  WHERE ("organization_members"."user_id" = "auth"."uid"()))));
+
+
+
+CREATE POLICY "Users can manage contraintes in their org" ON "public"."contraintes_optimisation" USING (("organization_id" IN ( SELECT "organization_members"."organization_id"
+   FROM "public"."organization_members"
+  WHERE ("organization_members"."user_id" = "auth"."uid"()))));
+
+
+
+CREATE POLICY "Users can manage evenements in their org" ON "public"."evenements" USING (("organization_id" IN ( SELECT "organization_members"."organization_id"
+   FROM "public"."organization_members"
+  WHERE ("organization_members"."user_id" = "auth"."uid"()))));
+
+
+
+CREATE POLICY "Users can manage inscriptions in their org" ON "public"."inscriptions" USING (("organization_id" IN ( SELECT "organization_members"."organization_id"
+   FROM "public"."organization_members"
+  WHERE ("organization_members"."user_id" = "auth"."uid"()))));
+
+
+
+CREATE POLICY "Users can update bus in their org" ON "public"."bus" FOR UPDATE USING (("organization_id" IN ( SELECT "organization_members"."organization_id"
+   FROM "public"."organization_members"
+  WHERE ("organization_members"."user_id" = "auth"."uid"()))));
+
+
+
+CREATE POLICY "Users can update items in their org" ON "public"."items" FOR UPDATE USING (("organization_id" IN ( SELECT "organizations"."id"
+   FROM "public"."organizations"
+  WHERE ("organizations"."owner_id" = "auth"."uid"()))));
+
+
+
+CREATE POLICY "Users can update own notifications" ON "public"."notifications" FOR UPDATE USING (("user_id" = "auth"."uid"()));
+
+
+
+CREATE POLICY "Users can update own profile" ON "public"."user_profiles" FOR UPDATE USING (("user_id" = "auth"."uid"()));
+
+
+
+CREATE POLICY "Users can update passagers in their org" ON "public"."passagers" FOR UPDATE USING (("organization_id" IN ( SELECT "organization_members"."organization_id"
+   FROM "public"."organization_members"
+  WHERE ("organization_members"."user_id" = "auth"."uid"()))));
+
+
+
+CREATE POLICY "Users can update route_stops in their org" ON "public"."route_stops" FOR UPDATE USING (("route_id" IN ( SELECT "routes"."id"
+   FROM "public"."routes"
+  WHERE ("routes"."organization_id" IN ( SELECT "organizations"."id"
+           FROM "public"."organizations"
+          WHERE ("organizations"."owner_id" = "auth"."uid"()))))));
+
+
+
+CREATE POLICY "Users can update routes in their org" ON "public"."routes" FOR UPDATE USING (("organization_id" IN ( SELECT "organizations"."id"
+   FROM "public"."organizations"
+  WHERE ("organizations"."owner_id" = "auth"."uid"()))));
+
+
+
+CREATE POLICY "Users can update sites in their org" ON "public"."sites" FOR UPDATE USING (("organization_id" IN ( SELECT "organizations"."id"
+   FROM "public"."organizations"
+  WHERE ("organizations"."owner_id" = "auth"."uid"()))));
+
+
+
+CREATE POLICY "Users can update tournees in their org" ON "public"."tournees" FOR UPDATE USING (("organization_id" IN ( SELECT "organization_members"."organization_id"
+   FROM "public"."organization_members"
+  WHERE ("organization_members"."user_id" = "auth"."uid"()))));
+
+
+
+CREATE POLICY "Users can update vehicles in their org" ON "public"."vehicles" FOR UPDATE USING (("organization_id" IN ( SELECT "organizations"."id"
+   FROM "public"."organizations"
+  WHERE ("organizations"."owner_id" = "auth"."uid"()))));
+
+
+
+CREATE POLICY "Users can view arrets in their org" ON "public"."arrets" FOR SELECT USING (("organization_id" IN ( SELECT "organization_members"."organization_id"
+   FROM "public"."organization_members"
+  WHERE ("organization_members"."user_id" = "auth"."uid"()))));
+
+
+
+CREATE POLICY "Users can view bus in their org" ON "public"."bus" FOR SELECT USING (("organization_id" IN ( SELECT "organization_members"."organization_id"
+   FROM "public"."organization_members"
+  WHERE ("organization_members"."user_id" = "auth"."uid"()))));
+
+
+
+CREATE POLICY "Users can view contraintes in their org" ON "public"."contraintes_optimisation" FOR SELECT USING (("organization_id" IN ( SELECT "organization_members"."organization_id"
+   FROM "public"."organization_members"
+  WHERE ("organization_members"."user_id" = "auth"."uid"()))));
+
+
+
+CREATE POLICY "Users can view evenements in their org" ON "public"."evenements" FOR SELECT USING (("organization_id" IN ( SELECT "organization_members"."organization_id"
+   FROM "public"."organization_members"
+  WHERE ("organization_members"."user_id" = "auth"."uid"()))));
+
+
+
+CREATE POLICY "Users can view inscriptions in their org" ON "public"."inscriptions" FOR SELECT USING (("organization_id" IN ( SELECT "organization_members"."organization_id"
+   FROM "public"."organization_members"
+  WHERE ("organization_members"."user_id" = "auth"."uid"()))));
+
+
+
+CREATE POLICY "Users can view items in their org" ON "public"."items" FOR SELECT USING (("organization_id" IN ( SELECT "organizations"."id"
+   FROM "public"."organizations"
+  WHERE ("organizations"."owner_id" = "auth"."uid"()))));
+
+
+
+COMMENT ON POLICY "Users can view items in their org" ON "public"."items" IS 'Les utilisateurs voient uniquement les items de leur organisation (via owner_id)';
+
+
+
+CREATE POLICY "Users can view own notifications" ON "public"."notifications" FOR SELECT USING (("user_id" = "auth"."uid"()));
+
+
+
+CREATE POLICY "Users can view own profile" ON "public"."user_profiles" FOR SELECT USING (("user_id" = "auth"."uid"()));
+
+
+
+CREATE POLICY "Users can view passagers in their org" ON "public"."passagers" FOR SELECT USING (("organization_id" IN ( SELECT "organization_members"."organization_id"
+   FROM "public"."organization_members"
+  WHERE ("organization_members"."user_id" = "auth"."uid"()))));
+
+
+
+CREATE POLICY "Users can view positions_gps in their org" ON "public"."positions_gps" FOR SELECT USING (("organization_id" IN ( SELECT "organization_members"."organization_id"
+   FROM "public"."organization_members"
+  WHERE ("organization_members"."user_id" = "auth"."uid"()))));
+
+
+
+CREATE POLICY "Users can view route_stops in their org" ON "public"."route_stops" FOR SELECT USING (("route_id" IN ( SELECT "routes"."id"
+   FROM "public"."routes"
+  WHERE ("routes"."organization_id" IN ( SELECT "organizations"."id"
+           FROM "public"."organizations"
+          WHERE ("organizations"."owner_id" = "auth"."uid"()))))));
+
+
+
+CREATE POLICY "Users can view routes in their org" ON "public"."routes" FOR SELECT USING (("organization_id" IN ( SELECT "organizations"."id"
+   FROM "public"."organizations"
+  WHERE ("organizations"."owner_id" = "auth"."uid"()))));
+
+
+
+CREATE POLICY "Users can view site occupancy in their org" ON "public"."sites" FOR SELECT USING (("organization_id" IN ( SELECT "organization_members"."organization_id"
+   FROM "public"."organization_members"
+  WHERE ("organization_members"."user_id" = "auth"."uid"()))));
+
+
+
+CREATE POLICY "Users can view sites in their org" ON "public"."sites" FOR SELECT USING (("organization_id" IN ( SELECT "organizations"."id"
+   FROM "public"."organizations"
+  WHERE ("organizations"."owner_id" = "auth"."uid"()))));
+
+
+
+COMMENT ON POLICY "Users can view sites in their org" ON "public"."sites" IS 'Les utilisateurs voient uniquement les sites de leur organisation (via owner_id)';
+
+
+
+CREATE POLICY "Users can view their own memberships" ON "public"."organization_members" FOR SELECT USING (("user_id" = "auth"."uid"()));
+
+
+
+COMMENT ON POLICY "Users can view their own memberships" ON "public"."organization_members" IS 'Les utilisateurs ne voient QUE leurs propres memberships (pas de sous-requête sur organization_members)';
+
+
+
+CREATE POLICY "Users can view tournees in their org" ON "public"."tournees" FOR SELECT USING (("organization_id" IN ( SELECT "organization_members"."organization_id"
+   FROM "public"."organization_members"
+  WHERE ("organization_members"."user_id" = "auth"."uid"()))));
+
+
+
+CREATE POLICY "Users can view vehicles in their org" ON "public"."vehicles" FOR SELECT USING (("organization_id" IN ( SELECT "organizations"."id"
+   FROM "public"."organizations"
+  WHERE ("organizations"."owner_id" = "auth"."uid"()))));
+
+
+
+COMMENT ON POLICY "Users can view vehicles in their org" ON "public"."vehicles" IS 'Les utilisateurs voient uniquement les véhicules de leur organisation (via owner_id)';
+
+
+
+ALTER TABLE "public"."accounts" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "accounts_read" ON "public"."accounts" FOR SELECT TO "authenticated" USING ((( SELECT "auth"."uid"() AS "uid") = "id"));
+
+
+
+CREATE POLICY "accounts_update" ON "public"."accounts" FOR UPDATE TO "authenticated" USING ((( SELECT "auth"."uid"() AS "uid") = "id")) WITH CHECK ((( SELECT "auth"."uid"() AS "uid") = "id"));
+
+
+
+ALTER TABLE "public"."arrets" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."bus" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."contraintes_optimisation" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."evenements" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."inscriptions" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."items" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."missions" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."notifications" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."organization_configs" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."organization_members" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."organizations" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."passagers" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."positions_gps" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."route_stops" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."routes" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."sites" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."tournees" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."user_profiles" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."vehicles" ENABLE ROW LEVEL SECURITY;
+
+
+
+
+ALTER PUBLICATION "supabase_realtime" OWNER TO "postgres";
+
+
+
+
+
+REVOKE USAGE ON SCHEMA "public" FROM PUBLIC;
+GRANT USAGE ON SCHEMA "public" TO "postgres";
+GRANT USAGE ON SCHEMA "public" TO "authenticated";
+GRANT USAGE ON SCHEMA "public" TO "service_role";
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+REVOKE ALL ON FUNCTION "kit"."get_storage_filename_as_uuid"("name" "text") FROM PUBLIC;
+GRANT ALL ON FUNCTION "kit"."get_storage_filename_as_uuid"("name" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "kit"."get_storage_filename_as_uuid"("name" "text") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "kit"."handle_update_user_email"() FROM PUBLIC;
+
+
+
+REVOKE ALL ON FUNCTION "kit"."new_user_created_setup"() FROM PUBLIC;
+
+
+
+REVOKE ALL ON FUNCTION "kit"."protect_account_fields"() FROM PUBLIC;
+
+
+
+
+
+
+
+
+
+REVOKE ALL ON FUNCTION "public"."create_organization_owner_member"() FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."create_organization_owner_member"() TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."create_user_profile_on_signup"() FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."create_user_profile_on_signup"() TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."notify_driver_on_assignment"() FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."notify_driver_on_assignment"() TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."notify_user"("p_user_id" "uuid", "p_org_id" "uuid", "p_type" character varying, "p_title" character varying, "p_message" "text", "p_link_type" character varying, "p_link_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."notify_user"("p_user_id" "uuid", "p_org_id" "uuid", "p_type" character varying, "p_title" character varying, "p_message" "text", "p_link_type" character varying, "p_link_id" "uuid") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."update_organization_config_timestamp"() FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."update_organization_config_timestamp"() TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."update_updated_at_column"() FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."update_updated_at_column"() TO "service_role";
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+GRANT ALL ON TABLE "public"."accounts" TO "anon";
+GRANT SELECT,INSERT,DELETE,UPDATE ON TABLE "public"."accounts" TO "authenticated";
+GRANT SELECT,INSERT,DELETE,UPDATE ON TABLE "public"."accounts" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."arrets" TO "anon";
+GRANT ALL ON TABLE "public"."arrets" TO "authenticated";
+GRANT ALL ON TABLE "public"."arrets" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."bus" TO "anon";
+GRANT ALL ON TABLE "public"."bus" TO "authenticated";
+GRANT ALL ON TABLE "public"."bus" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."contraintes_optimisation" TO "anon";
+GRANT ALL ON TABLE "public"."contraintes_optimisation" TO "authenticated";
+GRANT ALL ON TABLE "public"."contraintes_optimisation" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."evenements" TO "anon";
+GRANT ALL ON TABLE "public"."evenements" TO "authenticated";
+GRANT ALL ON TABLE "public"."evenements" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."inscriptions" TO "anon";
+GRANT ALL ON TABLE "public"."inscriptions" TO "authenticated";
+GRANT ALL ON TABLE "public"."inscriptions" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."invitations" TO "anon";
+GRANT ALL ON TABLE "public"."invitations" TO "authenticated";
+GRANT ALL ON TABLE "public"."invitations" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."items" TO "anon";
+GRANT ALL ON TABLE "public"."items" TO "authenticated";
+GRANT ALL ON TABLE "public"."items" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."missions" TO "anon";
+GRANT ALL ON TABLE "public"."missions" TO "authenticated";
+GRANT ALL ON TABLE "public"."missions" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."notifications" TO "anon";
+GRANT ALL ON TABLE "public"."notifications" TO "authenticated";
+GRANT ALL ON TABLE "public"."notifications" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."organization_configs" TO "anon";
+GRANT ALL ON TABLE "public"."organization_configs" TO "authenticated";
+GRANT ALL ON TABLE "public"."organization_configs" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."organization_members" TO "anon";
+GRANT ALL ON TABLE "public"."organization_members" TO "authenticated";
+GRANT ALL ON TABLE "public"."organization_members" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."organizations" TO "anon";
+GRANT ALL ON TABLE "public"."organizations" TO "authenticated";
+GRANT ALL ON TABLE "public"."organizations" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."passagers" TO "anon";
+GRANT ALL ON TABLE "public"."passagers" TO "authenticated";
+GRANT ALL ON TABLE "public"."passagers" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."positions_gps" TO "anon";
+GRANT ALL ON TABLE "public"."positions_gps" TO "authenticated";
+GRANT ALL ON TABLE "public"."positions_gps" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."route_stops" TO "anon";
+GRANT ALL ON TABLE "public"."route_stops" TO "authenticated";
+GRANT ALL ON TABLE "public"."route_stops" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."routes" TO "anon";
+GRANT ALL ON TABLE "public"."routes" TO "authenticated";
+GRANT ALL ON TABLE "public"."routes" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."sites" TO "anon";
+GRANT ALL ON TABLE "public"."sites" TO "authenticated";
+GRANT ALL ON TABLE "public"."sites" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."site_occupancy" TO "anon";
+GRANT ALL ON TABLE "public"."site_occupancy" TO "authenticated";
+GRANT ALL ON TABLE "public"."site_occupancy" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."tournees" TO "anon";
+GRANT ALL ON TABLE "public"."tournees" TO "authenticated";
+GRANT ALL ON TABLE "public"."tournees" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."user_profiles" TO "anon";
+GRANT ALL ON TABLE "public"."user_profiles" TO "authenticated";
+GRANT ALL ON TABLE "public"."user_profiles" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."vehicles" TO "anon";
+GRANT ALL ON TABLE "public"."vehicles" TO "authenticated";
+GRANT ALL ON TABLE "public"."vehicles" TO "service_role";
+
+
+
+
+
+
+
+
+
+ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON SEQUENCES  TO "postgres";
+ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON SEQUENCES  TO "anon";
+ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON SEQUENCES  TO "authenticated";
+ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON SEQUENCES  TO "service_role";
+
+
+
+
+
+
+ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON FUNCTIONS  TO "postgres";
+ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON FUNCTIONS  TO "service_role";
+
+
+
+
+
+
+ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON TABLES  TO "postgres";
+ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON TABLES  TO "anon";
+ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON TABLES  TO "authenticated";
+ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON TABLES  TO "service_role";
+
+
+
+
+
+
+ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" REVOKE ALL ON FUNCTIONS  FROM PUBLIC;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+RESET ALL;

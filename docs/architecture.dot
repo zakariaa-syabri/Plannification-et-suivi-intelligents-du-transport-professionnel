@@ -1,0 +1,235 @@
+// Architecture Globale du Système de Transport
+// Pour générer l'image: dot -Tpng architecture.dot -o architecture.png
+// Ou: dot -Tsvg architecture.dot -o architecture.svg
+
+digraph SystemeTransport {
+    // Configuration globale
+    rankdir=TB;
+    node [shape=rectangle, style=filled, fontname="Arial"];
+    edge [fontname="Arial"];
+
+    // Définition des sous-graphes par couche
+
+    subgraph cluster_presentation {
+        label="Couche Présentation";
+        style=filled;
+        color=lightgreen;
+
+        NextJS [label="Next.js 15\nFrontend", fillcolor=white];
+        MapBuilder [label="Map Builder\n(Admin/Dispatcher)", fillcolor=white];
+        DriverDash [label="Driver Dashboard\n(Conducteur)", fillcolor=white];
+        ClientDash [label="Client Dashboard\n(Suivi)", fillcolor=white];
+
+        NextJS -> MapBuilder [style=dotted];
+        NextJS -> DriverDash [style=dotted];
+        NextJS -> ClientDash [style=dotted];
+    }
+
+    subgraph cluster_business {
+        label="Couche Métier";
+        style=filled;
+        color=lightblue;
+
+        ServerActions [label="Server Actions\nNext.js", fillcolor=white];
+        FastAPI [label="FastAPI Service\nOptimization", fillcolor=white];
+        SupabaseAuth [label="Supabase Auth\nJWT", fillcolor=white];
+        Realtime [label="Supabase Realtime\nWebSocket", fillcolor=white];
+    }
+
+    subgraph cluster_data {
+        label="Couche Données";
+        style=filled;
+        color=orange;
+
+        PostgreSQL [label="PostgreSQL 15\nSupabase", shape=cylinder, fillcolor=white];
+        Redis [label="Redis Cache", shape=cylinder, fillcolor=white];
+        MQTT [label="MQTT Broker\nMosquitto", shape=box3d, fillcolor=white];
+        Storage [label="Supabase Storage\nFichiers", shape=folder, fillcolor=white];
+    }
+
+    subgraph cluster_external {
+        label="Services Externes";
+        style=filled;
+        color=violet;
+
+        ORTools [label="Google OR-Tools\nVRP Solver", fillcolor=white];
+        Maps [label="Google Maps API\nGeocoding", fillcolor=white];
+        Twilio [label="Twilio\nSMS", fillcolor=white];
+        SendGrid [label="SendGrid\nEmail", fillcolor=white];
+    }
+
+    // Connexions Présentation -> Métier
+    MapBuilder -> ServerActions [label="Créer mission"];
+    DriverDash -> ServerActions [label="Marquer arrêt"];
+    ClientDash -> Realtime [label="WebSocket\nsuivi"];
+
+    NextJS -> SupabaseAuth [label="Login/Signup"];
+
+    // Connexions Métier -> Données
+    ServerActions -> PostgreSQL [label="CRUD\noperations"];
+    ServerActions -> FastAPI [label="Optimize route"];
+    ServerActions -> Storage [label="Upload\nfichiers"];
+
+    SupabaseAuth -> PostgreSQL [label="Users"];
+    Realtime -> PostgreSQL [label="Listen\nchanges"];
+
+    // Connexions FastAPI
+    FastAPI -> PostgreSQL [label="Read data"];
+    FastAPI -> ORTools [label="Solve VRP"];
+    FastAPI -> Maps [label="Geocoding"];
+
+    // Connexions GPS
+    DriverDash -> MQTT [label="Publish GPS", style=dashed];
+    MQTT -> PostgreSQL [label="Store\nlocations"];
+
+    // Connexions notifications
+    ServerActions -> Twilio [label="Send SMS"];
+    ServerActions -> SendGrid [label="Send Email"];
+
+    // Cache
+    PostgreSQL -> Redis [label="Cache\nqueries", style=dotted];
+
+    // Légende
+    {
+        rank=same;
+        Legend1 [label="Légende:", shape=plaintext];
+        Legend2 [label="Ligne pleine = Sync", shape=plaintext];
+        Legend3 [label="Ligne pointillée = Async", shape=plaintext];
+    }
+}
+
+// Diagramme de déploiement
+digraph Deployment {
+    rankdir=LR;
+    node [shape=box3d, style=filled, fontname="Arial"];
+
+    subgraph cluster_users {
+        label="Utilisateurs";
+        color=lightgray;
+
+        User [label="Utilisateurs Web", fillcolor=lightblue];
+        Driver [label="Conducteurs\nMobile", fillcolor=lightgreen];
+    }
+
+    subgraph cluster_vercel {
+        label="Vercel Cloud";
+        color=lightblue;
+
+        NextJSServer [label="Next.js App\nServerless", fillcolor=white];
+        EdgeFunc [label="Edge Functions", fillcolor=white];
+    }
+
+    subgraph cluster_supabase {
+        label="Supabase Cloud";
+        color=lightgreen;
+
+        AuthService [label="Auth Service", fillcolor=white];
+        DBService [label="Database Service", fillcolor=white];
+        RTService [label="Realtime Service", fillcolor=white];
+        StorageService [label="Storage Service", fillcolor=white];
+    }
+
+    subgraph cluster_aws {
+        label="AWS / Cloud Server";
+        color=orange;
+
+        FastAPIServer [label="FastAPI\nDocker Container", fillcolor=white];
+        MQTTBroker [label="MQTT Broker\nMosquitto", fillcolor=white];
+        RedisCache [label="Redis", shape=cylinder, fillcolor=white];
+    }
+
+    CDN [label="Cloudflare CDN", shape=hexagon, fillcolor=yellow];
+
+    User -> CDN [label="HTTPS"];
+    CDN -> NextJSServer [label="Static\nAssets"];
+
+    User -> NextJSServer [label="HTTPS\nRequest"];
+    Driver -> NextJSServer [label="HTTPS\nRequest"];
+
+    NextJSServer -> AuthService [label="Login"];
+    NextJSServer -> DBService [label="Data CRUD"];
+    NextJSServer -> RTService [label="WebSocket"];
+    NextJSServer -> FastAPIServer [label="Optimize"];
+
+    FastAPIServer -> DBService [label="Read data"];
+    FastAPIServer -> RedisCache [label="Cache"];
+
+    Driver -> MQTTBroker [label="GPS Stream", style=dashed];
+    MQTTBroker -> DBService [label="Store"];
+}
+
+// Diagramme de flux - Optimisation de route
+digraph OptimizationFlow {
+    rankdir=TB;
+    node [fontname="Arial"];
+
+    Start [label="Dispatcher ouvre\nMap Builder", shape=ellipse, fillcolor=lightgreen, style=filled];
+
+    AddSites [label="Ajoute sites\nsur carte", shape=box];
+    AddItems [label="Ajoute items\n(colis)", shape=box];
+    AddVehicles [label="Ajoute véhicules\navec capacités", shape=box];
+    CreateMission [label="Clique\nCréer Mission", shape=box];
+
+    SaveDB [label="INSERT missions,\nitems, sites", shape=cylinder, fillcolor=orange, style=filled];
+
+    ClickOptimize [label="Clique\nOptimiser Route", shape=box, fillcolor=yellow, style=filled];
+
+    CallAPI [label="POST /api/optimize/route\n{locations, constraints}", shape=parallelogram];
+
+    BuildMatrix [label="Construit matrice\nde distances", shape=box, fillcolor=lightblue, style=filled];
+
+    SolveVRP [label="Résoudre VRP/VRPTW\nGoogle OR-Tools", shape=box, fillcolor=violet, style=filled];
+
+    ReturnSolution [label="Retourne solution\n{stops[], distance, ETA}", shape=parallelogram];
+
+    SaveRoute [label="INSERT routes,\nroute_stops", shape=cylinder, fillcolor=orange, style=filled];
+
+    DisplayMap [label="Affiche route\nsur carte avec polyline", shape=box, fillcolor=lightgreen, style=filled];
+
+    End [label="Route optimisée\net sauvegardée", shape=ellipse, fillcolor=green, style=filled];
+
+    Start -> AddSites;
+    AddSites -> AddItems;
+    AddItems -> AddVehicles;
+    AddVehicles -> CreateMission;
+    CreateMission -> SaveDB;
+    SaveDB -> ClickOptimize;
+    ClickOptimize -> CallAPI;
+    CallAPI -> BuildMatrix;
+    BuildMatrix -> SolveVRP;
+    SolveVRP -> ReturnSolution;
+    ReturnSolution -> SaveRoute;
+    SaveRoute -> DisplayMap;
+    DisplayMap -> End;
+}
+
+// Diagramme de sécurité
+digraph Security {
+    rankdir=TB;
+    node [fontname="Arial", shape=box];
+
+    subgraph cluster_layers {
+        label="Couches de Sécurité";
+        style=filled;
+        color=lightgray;
+
+        L1 [label="1. HTTPS/TLS\nChiffrement en transit", fillcolor=green, style=filled];
+        L2 [label="2. Authentication\nJWT Token", fillcolor=yellow, style=filled];
+        L3 [label="3. Authorization\nRow Level Security", fillcolor=orange, style=filled];
+        L4 [label="4. Validation\nInput validation (Zod)", fillcolor=red, style=filled];
+        L5 [label="5. Rate Limiting\nProtection DDoS", fillcolor=purple, style=filled];
+        L6 [label="6. Encryption at Rest\nAES-256 Database", fillcolor=blue, style=filled];
+
+        L1 -> L2 [label="Request"];
+        L2 -> L3 [label="Authenticated"];
+        L3 -> L4 [label="Authorized"];
+        L4 -> L5 [label="Valid"];
+        L5 -> L6 [label="Accepted"];
+    }
+
+    Client [label="Client Browser", shape=ellipse];
+    Database [label="PostgreSQL\nDatabase", shape=cylinder];
+
+    Client -> L1;
+    L6 -> Database;
+}

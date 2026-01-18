@@ -1,0 +1,37 @@
+-- Migration: Corregir el trigger create_organization_owner_member
+-- El trigger debe créer el member con approved=true
+
+DROP TRIGGER IF EXISTS on_organization_created ON public.organizations;
+
+DROP FUNCTION IF EXISTS create_organization_owner_member();
+
+CREATE OR REPLACE FUNCTION create_organization_owner_member()
+RETURNS TRIGGER AS $$
+BEGIN
+  INSERT INTO public.organization_members (
+    organization_id,
+    user_id,
+    role,
+    user_type,
+    approved,
+    joined_at
+  )
+  VALUES (
+    NEW.id,
+    NEW.owner_id,
+    'dispatcher',  -- Dispatcher por defecto, no owner
+    'dispatcher',
+    true,          -- IMPORTANTE: approved=true para que getCurrentOrganization lo encuentre
+    now()
+  );
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+-- Recrear el trigger
+CREATE TRIGGER on_organization_created
+  AFTER INSERT ON public.organizations
+  FOR EACH ROW
+  EXECUTE FUNCTION create_organization_owner_member();
+
+COMMENT ON FUNCTION create_organization_owner_member() IS 'Crée automatiquement un miembro dispatcher aprobado cuando se crea una organización';

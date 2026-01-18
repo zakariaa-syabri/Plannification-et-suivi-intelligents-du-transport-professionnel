@@ -1,0 +1,72 @@
+version: '3.8'
+
+services:
+  # API FastAPI Transport
+  transport-api:
+    build:
+      context: ./modules/transport
+      dockerfile: Dockerfile
+    container_name: transport-api
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_HOST=supabase-db
+      - DATABASE_PORT=5432
+      - DATABASE_NAME=postgres
+      - DATABASE_USER=postgres
+      - DATABASE_PASSWORD=postgres
+      - DATABASE_URL=postgresql://postgres:postgres@supabase-db:5432/postgres
+      - MQTT_BROKER=mqtt-broker
+      - MQTT_PORT=1883
+      - CORS_ORIGINS=http://localhost:3000,http://localhost:3001
+    volumes:
+      - ./modules/transport:/app
+    depends_on:
+      - supabase-db
+      - mqtt-broker
+    networks:
+      - transport-network
+    restart: unless-stopped
+
+  # Broker MQTT pour le tracking temps réel
+  mqtt-broker:
+    image: eclipse-mosquitto:2.0
+    container_name: mqtt-broker
+    ports:
+      - "1883:1883"
+      - "9001:9001"
+    volumes:
+      - ./config/mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - mqtt-data:/mosquitto/data
+      - mqtt-logs:/mosquitto/log
+    networks:
+      - transport-network
+    restart: unless-stopped
+
+  # PostgreSQL (Supabase local)
+  # Note: Si vous utilisez déjà Supabase local via pnpm supabase:start,
+  # vous pouvez commenter ce service et utiliser le port 54322 directement
+  supabase-db:
+    image: supabase/postgres:15.1.0.117
+    container_name: supabase-db
+    ports:
+      - "5433:5432"
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    volumes:
+      - supabase-db-data:/var/lib/postgresql/data
+      # Chargement automatique des migrations
+      - ./apps/web/supabase/migrations:/docker-entrypoint-initdb.d:ro
+    networks:
+      - transport-network
+    restart: unless-stopped
+
+volumes:
+  mqtt-data:
+  mqtt-logs:
+  supabase-db-data:
+
+networks:
+  transport-network:
+    driver: bridge
